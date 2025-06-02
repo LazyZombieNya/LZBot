@@ -3,62 +3,59 @@ import os
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, \
+    CallbackQueryHandler, CallbackContext
 
 load_dotenv()  # Загружаем переменные из .env
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-AI_PROMPT = os.getenv("AI_PROMPT")
+AI_PROMPT_TGM = os.getenv("AI_PROMPT_TGM")
+AI_PROMPT_PM = os.getenv("AI_PROMPT_PM")
+AI_PROMPT_GM = os.getenv("AI_PROMPT_GM")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 
-# Настройка Gemini
+# Инициализация Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 # Включаем логирование
 logging.basicConfig(level=logging.INFO)
 
-# хранилище оригинальных вопросов
+# Хранилище сообщений для кнопки "Подробнее"
 detailed_questions = {}
 
-# Хранилище индивидуальных чатов: user_id -> chat
+# История чатов по user_id или chat_id
 user_chats = {}
+
+# Ограничения Telegram
+MAX_MESSAGE_LENGTH = 4096
 
 # Ответ от Gemini
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #user_id = update.message.from_user.id
-    is_short = False
     message = update.effective_message #Получает само сообщение, будь то из чата или группы.
     user_id = message.from_user.id
     chat_id = message.chat_id
     text = message.text
-    is_private = message.chat.type == 'private' #Определяем группа или личка. True — если это ЛС. False — если группа или супергруппа.
+    # Ключ истории: отдельно для каждого пользователя или группы.
+    history_key = user_id if message.chat.type == 'private' else chat_id
+
     is_reply_to_bot = ( #Если боту нажали ответить
             message.reply_to_message and
             message.reply_to_message.from_user and
             message.reply_to_message.from_user.id == context.bot.id
     )
 
-    # Ключ истории: отдельно для каждого пользователя или группы
-    history_key = user_id if is_private else chat_id
-
-    # Создаём чат, если ещё не было
-    if history_key not in user_chats:
-        new_chat = model.start_chat(history=[])
-        new_chat.send_message(AI_PROMPT)
-        user_chats[history_key] = new_chat
-
-    chat = user_chats[history_key]
-
     try:
         # Определяем, что спросить у нейросети
-        if not is_private:
+        if message.chat.type != 'private': #True — если это ЛС. False — если группа или супергруппа.
             # прямое обращение или replay на бота — отвечаем полно
             if (f"@{context.bot.username.lower()}" in text.lower()) or (is_reply_to_bot):
-                gemini_prompt = text
+                gemini_prompt = f"{user_id} пишет: {text}"
+                is_short = False
             # Если вопрос и не обращение напрямую — ответ кратко
             elif "?" in text and not message.text.lower().startswith('@'):
-                gemini_prompt = f"{text}\n\nОтветь кратко, 1-2 предложениями."
+                gemini_prompt = f"{user_id} пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
                 # Сохраняем вопрос по message_id
                 detailed_questions[message.message_id] = text
                 is_short = True
@@ -66,10 +63,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return  # в остальных случаях в группе игнорируем
         else:
             gemini_prompt = text  # в личке всегда отвечаем полно
+            is_short = False
 
+        # Запрос к ИИ
+        reply = await ask_gemini(history_key, gemini_prompt, message.chat.type)
 
-        response = chat.send_message(gemini_prompt)
-        reply = response.text
         if is_short:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{message.message_id}:{user_id}")]
@@ -82,27 +80,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Ошибка Gemini: {e}")
         await update.message.reply_text("⚠️ Ошибка Gemini: " + str(e))
 
+# Универсальная функция запроса к Gemini
+async def ask_gemini(user_or_chat_id, prompt: str, chat_type):
+    # Если чата ещё нет — создаём
+    if user_or_chat_id not in user_chats:
+        chat = model.start_chat(history=[])
+        user_chats[user_or_chat_id] = chat
+        chat.send_message(get_system_prompt(chat_type)) #В зависимости от типа чата говорим чату как надо себя вести
+    chat = user_chats[user_or_chat_id]
+
+    try:
+        response = chat.send_message(prompt)
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка запроса к Gemini: {e}")
+        return f"⚠️ Ошибка Gemini: {e}"
+
+def get_system_prompt(chat_type):
+    if chat_type == 'private':
+        return AI_PROMPT_PM
+    else:
+        return (
+            AI_PROMPT_GM
+        )
+
+
 #Функция обрезки сообщения на части
-def split_message(text, max_length=4000):
+def split_message(message):
     parts = []
-    while len(text) > max_length:
-        split_at = text.rfind("\n", 0, max_length)
-        if split_at == -1:
-            split_at = max_length
-        parts.append(text[:split_at].strip())
-        text = text[split_at:].strip()
-    parts.append(text)
+    while len(message) > MAX_MESSAGE_LENGTH:
+        split_index = message[:MAX_MESSAGE_LENGTH].rfind("\n")
+        if split_index == -1:
+            split_index = MAX_MESSAGE_LENGTH
+        parts.append(message[:split_index])
+        message = message[split_index:]
+    parts.append(message)
     return parts
 
-# Приветствие новых участников
-async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Приветствие новых участников через нейросеть
+async def welcome_new_member(update: Update, context: CallbackContext):
     for member in update.message.new_chat_members:
         # Не приветствовать самого бота
         if member.id == context.bot.id:
             continue
 
+        chat_id = update.effective_chat.id
+        username = member.full_name  # Можно использовать member.mention_html() для HTML-отметки
+        prompt = (
+            f"В нашу группу  присоединился новый участник по имени {username}. "
+            "Приветствуй его дружелюбно и с юмором от имени группы, используй контекст наших последних сообщений"
+        )
+        reply = await ask_gemini(chat_id, prompt, chat_type="group")
+
         await update.message.reply_text(
-            f"👋 Добро пожаловать, {member.mention_html()}!",
+            reply,
             parse_mode='HTML'
         )
 
@@ -130,16 +161,7 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         #     return
 
         # Отправляем тот же вопрос с уточнением
-        chat = user_chats.get(original_user_id)
-        if chat is None:
-            chat = model.start_chat(history=[])
-            chat.send_message(AI_PROMPT)
-            user_chats[original_user_id] = chat
-
-        # Добавляем уточнение к вопросу
-        full_question = f"Объясни подробнее: {question}"
-        response = chat.send_message(full_question)
-        detailed_reply = response.text.strip()
+        detailed_reply = await ask_gemini(original_user_id, f"Объясни подробнее: {question}", chat_type="private")
 
         for part in split_message(detailed_reply):
             await query.message.reply_text(part)
@@ -150,7 +172,7 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "🤖 <b>Я — бот с ИИ на базе Gemini</b>\n\n"
+        "🤖 <b>Я — бот с ИИ на базе Gemini-2.0-flash</b>\n\n"
         "Вот что я умею:\n"
         "• 📩 Отвечаю кратко на сообщения, содержащие <b>вопросительный знак '?'</b> (в группе)\n"
         "• 🔎 Поддержка кнопки <b>«Подробнее»</b> к краткому ответу\n"
@@ -163,15 +185,23 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # 🔁 Команда /reset — сброс истории
-async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    new_chat = model.start_chat(history=[])
-    new_chat.send_message(AI_PROMPT)
-    user_chats[user_id] = new_chat
-    await update.message.reply_text("🧹 История диалога сброшена! Начнём с чистого листа.")
+async def reset_history(update: Update, context: CallbackContext):
+    key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
+    if key in user_chats:
+        del user_chats[key]
+        await update.message.reply_text("🧼 Контекст сброшен!")
+    else:
+        await update.message.reply_text("ℹ️ Контекст уже пуст.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Привет! Я работаю через gemini-2.0-flash. Напиши мне что-нибудь!')
+# Обработка команды /start
+async def start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    prompt = ("Поздоровайся с пользователем телеграмм бота, представься и кратко расскажи, что ты умеешь."
+              f"Это тебе в помощь: подключена модель {GEMINI_MODEL} и есть кнопка /help")
+
+    reply = await ask_gemini(user_id, prompt, chat_type)
+    await update.message.reply_text(reply)
 
 #Установка команд в бота
 async def set_commands(application):
