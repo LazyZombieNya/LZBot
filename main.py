@@ -77,8 +77,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for part in split_message(reply):
                 await update.message.reply_text(part)
     except Exception as e:
-        logging.error(f"Ошибка Gemini: {e}")
-        await update.message.reply_text("⚠️ Ошибка Gemini: " + str(e))
+        logging.error(f"Ошибка: {e}")
+
 
 # Универсальная функция запроса к Gemini
 async def ask_gemini(user_or_chat_id, prompt: str, chat_type):
@@ -93,8 +93,17 @@ async def ask_gemini(user_or_chat_id, prompt: str, chat_type):
         response = chat.send_message(prompt)
         return response.text.strip()
     except Exception as e:
-        logging.error(f"Ошибка запроса к Gemini: {e}")
-        return f"⚠️ Ошибка Gemini: {e}"
+        error_text = str(e)
+
+        if "429" in error_text:
+            return (
+                f"⚠️ <b>Слишком много запросов для {GEMINI_MODEL}</b>\n"
+                "Подожди немного и попробуй снова через минуту.\n\n"
+                "<a href='https://ai.google.dev/gemini-api/docs/rate-limits'>Документация по лимитам</a>"
+            )
+        else:
+            logging.error(f"Ошибка запроса к Gemini: {e}")
+            return f"⚠️ Ошибка Gemini: {e}"
 
 def get_system_prompt(chat_type):
     if chat_type == 'private':
