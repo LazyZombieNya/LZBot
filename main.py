@@ -1,7 +1,8 @@
 import logging
 import os
-
+import asyncio
 import google.generativeai as genai
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, \
@@ -24,9 +25,10 @@ logging.basicConfig(level=logging.INFO)
 
 # Хранилище сообщений для кнопки "Подробнее"
 detailed_questions = {}
-
 # История чатов по user_id или chat_id
 user_chats = {}
+# Сюда будем сохранять время окончания молчания по chat_id
+mute_until = {}
 
 # Ограничения Telegram
 MAX_MESSAGE_LENGTH = 4096
@@ -39,6 +41,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text
     # Ключ истории: отдельно для каждого пользователя или группы.
     history_key = user_id if message.chat.type == 'private' else chat_id
+
+    silent = chat_id in mute_until and datetime.utcnow() < mute_until[chat_id]
+
 
     is_reply_to_bot = ( #Если боту нажали ответить
             message.reply_to_message and
@@ -54,7 +59,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 gemini_prompt = f"{user_id} пишет: {text}"
                 is_short = False
             # Если вопрос и не обращение напрямую — ответ кратко
-            elif "?" in text and not message.text.lower().startswith('@'):
+            elif (("?" in text) and (not silent)
+                  and(not text.lower().startswith('@')) and (await is_bot_relevant(history_key,text,message.chat.type))):
                 gemini_prompt = f"{user_id} пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
                 # Сохраняем вопрос по message_id
                 detailed_questions[message.message_id] = text
@@ -70,12 +76,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if is_short:
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{message.message_id}:{user_id}")]
+                [InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{message.message_id}"),
+                InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{message.message_id}:{user_id}")]
             ])
-            await update.message.reply_text(reply, reply_markup=keyboard)
+            await update.message.reply_text(reply,parse_mode='HTML', reply_markup=keyboard)
         else:
             for part in split_message(reply):
-                await update.message.reply_text(part)
+                await update.message.reply_text(part,parse_mode='HTML')
     except Exception as e:
         logging.error(f"Ошибка: {e}")
 
@@ -113,6 +120,14 @@ def get_system_prompt(chat_type):
             AI_PROMPT_GM
         )
 
+async def is_bot_relevant(user_or_chat_id,text: str,chat_type) -> bool:
+    prompt = (
+        f"Вопрос: {text}\n"
+        "Можешь ли ты дать точный или полезный ответ на этот вопрос без доступа к физическому окружению и без участия человека? "
+        "Если да — скажи 'Да'. Если это вопрос только к людям (например, о расположении предметов, действиях людей, вещах в комнате), скажи 'Нет'."
+    )
+    reply = await ask_gemini(user_or_chat_id, prompt, chat_type)
+    return "да" in reply.lower()
 
 #Функция обрезки сообщения на части
 def split_message(message):
@@ -173,7 +188,7 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         detailed_reply = await ask_gemini(original_user_id, f"Объясни подробнее: {question}", chat_type="private")
 
         for part in split_message(detailed_reply):
-            await query.message.reply_text(part)
+            await query.message.reply_text(part, parse_mode='HTML')
 
     except Exception as e:
         logging.error(f"Ошибка при обработке кнопки: {e}")
@@ -183,7 +198,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🤖 <b>Я — бот с ИИ на базе Gemini-2.0-flash</b>\n\n"
         "Вот что я умею:\n"
-        "• 📩 Отвечаю кратко на сообщения, содержащие <b>вопросительный знак '?'</b> (в группе)\n"
+        "• 📩 Отвечаю кратко на сообщения, содержащие <b>вопросительный знак '?'</b> (в группе) если знаю ответ\n"
         "• 🔎 Поддержка кнопки <b>«Подробнее»</b> к краткому ответу\n"
         "• 👤 Отвечаю, если вы обратились <b>ко мне напрямую</b>\n"
         "• 🔁 Команда <b>/reset</b> — сбрасывает историю диалога\n"
@@ -212,6 +227,44 @@ async def start(update: Update, context: CallbackContext):
     reply = await ask_gemini(user_id, prompt, chat_type)
     await update.message.reply_text(reply)
 
+# Замолчать и не отвечать на вопросы 10 мин.
+async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        data = query.data  # format: silence:<chat_id>:<message_id>
+        _, chat_id_str, msg_id_str = data.split(':')
+        chat_id = int(chat_id_str)
+        msg_id = int(msg_id_str)
+
+        # Устанавливаем молчание на 10 минут
+        mute_until[chat_id] = datetime.utcnow() + timedelta(minutes=10)
+
+        # Меняем кнопку на ⏳
+        new_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Молчу 10мин…", callback_data="noop")]])
+        await query.edit_message_reply_markup(reply_markup=new_keyboard)
+
+        # Возврат кнопок через 10 минут
+       #await asyncio.sleep(600)
+
+        # Возвращаем старые кнопки
+        # original_question = detailed_questions.get(msg_id)
+        # if original_question:
+        #     keyboard = InlineKeyboardMarkup([[
+        #         InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{msg_id}"),
+        #         InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{msg_id}:{query.from_user.id}")
+        #     ]])
+        #     try:
+        #         await query.message.edit_reply_markup(reply_markup=keyboard)
+        #         mute_until.pop(chat_id, None)  # Удаляем "молчание"
+        #     except Exception as e:
+        #         logging.warning(f"Не удалось вернуть кнопки: {e}")
+
+    except Exception as e:
+        logging.error(f"Ошибка в кнопке Тише: {e}")
+
+
 #Установка команд в бота
 async def set_commands(application):
     commands = [
@@ -225,6 +278,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("reset", reset_history))
     app.add_handler(CommandHandler("help", show_help))
+    app.add_handler(CallbackQueryHandler(silence_callback, pattern="^silence:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(CallbackQueryHandler(expand_callback, pattern="^more:"))
