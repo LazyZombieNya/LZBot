@@ -11,10 +11,13 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 load_dotenv()  # Загружаем переменные из .env
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-AI_PROMPT_TGM = os.getenv("AI_PROMPT_TGM")
-AI_PROMPT_PM = os.getenv("AI_PROMPT_PM")
-AI_PROMPT_GM = os.getenv("AI_PROMPT_GM")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+#Промты для задач
+AI_PROMPT_TGM = os.getenv("AI_PROMPT_TGM") #Основной промт при запуске нового чата, который объясняет что нейронка находится в телеграмм боте
+AI_PROMPT_PM = os.getenv("AI_PROMPT_PM") #Объясняет что это чат личный
+AI_PROMPT_GM = os.getenv("AI_PROMPT_GM") #Объясняет что это чат групповой
+AI_PROMPT_IS_RELEVANT_QUESTION  = os.getenv("AI_PROMPT_IS_RELEVANT_QUESTION") #  Технический вопрос для решения ложноположительных "да" в неуверенных или расплывчатых ответах от модели.
+
 
 # Инициализация Gemini
 genai.configure(api_key=GEMINI_API_KEY)
@@ -120,11 +123,12 @@ def get_system_prompt(chat_type):
             AI_PROMPT_GM
         )
 
+# Проверка нейронки на возможность дать корректный ответ, чтобы избежать ложноположительных "да" в неуверенных или расплывчатых ответах от модели.
 async def is_bot_relevant(user_or_chat_id,text: str,chat_type) -> bool:
     prompt = (
-        f"Вопрос: {text}\n"
-        "Можешь ли ты дать точный или полезный ответ на этот вопрос без доступа к физическому окружению и без участия человека? "
-        "Если да — скажи 'Да'. Если это вопрос только к людям (например, о расположении предметов, действиях людей, вещах в комнате), скажи 'Нет'."
+        f"Отвечать не нужно. Не сохраняй в памяти это. Просто проанализируй вопрос: {text}\n"
+        f"{AI_PROMPT_IS_RELEVANT_QUESTION}"
+        "Ответ должен быть только 'Да' или 'Нет'."
     )
     reply = await ask_gemini(user_or_chat_id, prompt, chat_type)
     return "да" in reply.lower()
@@ -242,7 +246,7 @@ async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mute_until[chat_id] = datetime.utcnow() + timedelta(minutes=10)
 
         # Меняем кнопку на ⏳
-        new_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Молчу 10мин…", callback_data="noop")]])
+        new_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Молчу 10 мин…", callback_data="noop")]])
         await query.edit_message_reply_markup(reply_markup=new_keyboard)
 
         # Возврат кнопок через 10 минут
