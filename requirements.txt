@@ -1,0 +1,11 @@
+python-telegram-bot~=22.0
+google-generativeai
+python-dotenv~=1.1.0
+httpx
+aiohttp
+aiogram 
+google-generativeai 
+Pillow
+protobuf~=5.29.4
+dotenv~=0.9.9
+telegram~=0.0.1
