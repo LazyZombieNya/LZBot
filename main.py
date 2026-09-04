@@ -1,10 +1,11 @@
-# bot_gemini_improved.py
 import logging
 import os
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+import aiosqlite
 from dotenv import load_dotenv
 import google.generativeai as genai
+from openai import AsyncOpenAI
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,52 +21,121 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1")
 
-# prompts
+# Клиент Groq
+groq_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_URL)
+
+# Prompts
 AI_PROMPT_TGM = os.getenv("AI_PROMPT_TGM", "")
 AI_PROMPT_PM = os.getenv("AI_PROMPT_PM", "")
 AI_PROMPT_GM = os.getenv("AI_PROMPT_GM", "")
 AI_PROMPT_IS_RELEVANT_QUESTION = os.getenv("AI_PROMPT_IS_RELEVANT_QUESTION", "")
 
-# init
+# Init Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Globals
-# Кэш объектов моделей: {model_name: genai.GenerativeModel(...)}
-models_cache = {}
-# Какая модель выбрана для пользователя или чата: key = user_id or chat_id
-user_selected_model = {}
-# История чатов: key = user_or_chat_id -> chat object
-user_chats = {}
-# Последний запрос времени для анти-спама: key -> datetime
-last_request_time = {}
-# Пер-процессный семафор чтобы снизить число одновременных запросов к Gemini
-GLOBAL_SEMAPHORE = asyncio.Semaphore(1)  # можно поднять до 2 при необходимости
-# Пер-пользовательская блокировка (чтобы один пользователь не создавал параллельных запросов)
-user_locks = {}
+# Путь к файлу базы данных SQLite
+DB_PATH = "chat_history.db"
 
-# Telegram constraints
+# Globals
+models_cache = {}
+user_selected_model = {}
+user_chats = {}
+last_request_time = {}
+GLOBAL_SEMAPHORE = asyncio.Semaphore(1)
+user_locks = {}
+active_tasks = {}
+
 MAX_MESSAGE_LENGTH = 4096
 
-# Поддерживаемые модели для выбора пользователем
 AVAILABLE_MODELS = [
-    "gemini-3-pro",
-    "gemini-3-pro-preview",
-    "gemini-3-flash",
-    "gemini-3-flash-preview",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 ]
 
-RATE_LIMIT_SECONDS_PER_USER = 1.0  # минимальный интервал между запросами от одного пользователя
+RATE_LIMIT_SECONDS_PER_USER = 1.0
 
+
+# ==========================================
+# РАБОТА С БАЗОЙ ДАННЫХ (SQLite)
+# ==========================================
+
+async def init_db():
+    """Создание таблицы для хранения истории диалогов"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+                         CREATE TABLE IF NOT EXISTS messages
+                         (
+                             id
+                             INTEGER
+                             PRIMARY
+                             KEY
+                             AUTOINCREMENT,
+                             chat_key
+                             TEXT,
+                             role
+                             TEXT,
+                             content
+                             TEXT,
+                             created_at
+                             TIMESTAMP
+                             DEFAULT
+                             CURRENT_TIMESTAMP
+                         )
+                         """)
+        await db.commit()
+
+
+async def add_message_to_db(chat_key, role: str, content: str):
+    """Сохранение реплики пользователя или ассистента"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO messages (chat_key, role, content) VALUES (?, ?, ?)",
+                (str(chat_key), role, content)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка записи в БД: {e}")
+
+
+async def get_history_from_db(chat_key, limit: int = 10):
+    """Чтение последних N сообщений для контекста"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT role, content FROM messages WHERE chat_key = ? ORDER BY id DESC LIMIT ?",
+                (str(chat_key), limit)
+            )
+            rows = await cursor.fetchall()
+            return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    except Exception as e:
+        logger.error(f"Ошибка чтения из БД: {e}")
+        return []
+
+
+async def clear_history_in_db(chat_key):
+    """Очистка контекста пользователя в БД"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM messages WHERE chat_key = ?", (str(chat_key),))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка очистки БД: {e}")
+
+
+# ==========================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
 
 def get_model_obj(model_name: str):
-    """Возвращает или создаёт объект genai.GenerativeModel для model_name"""
     if model_name in models_cache:
         return models_cache[model_name]
     model_obj = genai.GenerativeModel(model_name)
@@ -76,8 +146,7 @@ def get_model_obj(model_name: str):
 def get_system_prompt(chat_type):
     if chat_type == "private":
         return AI_PROMPT_PM or ""
-    else:
-        return AI_PROMPT_GM or ""
+    return AI_PROMPT_GM or ""
 
 
 def split_message(message: str):
@@ -93,7 +162,6 @@ def split_message(message: str):
 
 
 async def ensure_user_lock(key):
-    """Возвращает асинхронный lock для определённого key"""
     if key not in user_locks:
         user_locks[key] = asyncio.Lock()
     return user_locks[key]
@@ -106,7 +174,6 @@ async def typing_sender(chat_id: int, context: ContextTypes.DEFAULT_TYPE, stop_e
         except Exception as e:
             logger.debug(f"Не удалось отправить typing: {e}")
 
-        # Проверяем событие каждые 4 секунды
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=4)
         except asyncio.TimeoutError:
@@ -115,86 +182,122 @@ async def typing_sender(chat_id: int, context: ContextTypes.DEFAULT_TYPE, stop_e
 
 def parse_gemini_error(error: Exception) -> str:
     err = str(error)
-    """Возвращает структурированное сообщение об ошибке"""
-
     if "limit: 0" in err or "limit:0" in err:
         return "Эта модель недоступна или отключена для текущего тарифа."
-
     if "Quota exceeded" in err:
-        return "Превышена квота использования этой модели. Попробуйте позже или выберите другую модель."
-
+        return "Превышена квота использования этой модели. Попробуйте позже."
     if "per minute" in err or "Resource has been exhausted" in err:
-        return "Слишком много запросов подряд. Подождите несколько секунд и попробуйте снова."
-
+        return "Слишком много запросов подряд. Подождите несколько секунд."
     if "Invalid argument" in err:
-        return "Модель отклонила запрос. Возможно, он слишком длинный или содержит неподдерживаемый формат."
-
+        return "Модель отклонила запрос."
     if "internal" in err or "500" in err:
-        return "Внутренняя ошибка сервера Google. Попробуйте повторить запрос."
+        return "Внутренняя ошибка сервера Google."
+    return "Неизвестная ошибка Gemini."
 
-    return "Неизвестная ошибка. Логи содержат подробности."
 
+# ==========================================
+# ОСНОВНАЯ ЛОГИКА ИИ И FALLBACK
+# ==========================================
 
 async def ask_gemini(user_or_chat_id, prompt: str, chat_type: str, selected_model: str = None, max_retries: int = 3):
-    """
-    Универсальная функция запроса к Gemini с:
-    - глобальным семафором (чтобы не посылать много параллельных запросов),
-    - экспоненциальным бэкоффом на 429,
-    - использованием системного промпта,
-    - возвратом текстового ответа или исключительной строки ошибки.
-    """
-
     model_name = selected_model or user_selected_model.get(user_or_chat_id) or DEFAULT_MODEL
     model_obj = get_model_obj(model_name)
 
-    # Ensure there is a chat object
+    # 1. Если сессия не в памяти — восстанавливаем её из SQLite
     if user_or_chat_id not in user_chats:
-        chat_obj = model_obj.start_chat(history=[])
+        db_history = await get_history_from_db(user_or_chat_id, limit=10)
+        gemini_history = []
+        for msg in db_history:
+            role = "model" if msg["role"] == "assistant" else "user"
+            gemini_history.append({"role": role, "parts": [msg["content"]]})
+
+        chat_obj = model_obj.start_chat(history=gemini_history)
         user_chats[user_or_chat_id] = chat_obj
-        # отправляем system prompt
-        sys_prompt = get_system_prompt(chat_type)
-        if sys_prompt:
-            # блокирующее вызов: делаем в отдельном потоке
-            await asyncio.to_thread(chat_obj.send_message, sys_prompt)
+
+        # Если истории не было, инициализируем системным промптом
+        if not gemini_history:
+            sys_prompt = get_system_prompt(chat_type)
+            if sys_prompt:
+                try:
+                    await asyncio.to_thread(chat_obj.send_message, sys_prompt)
+                except Exception:
+                    pass
 
     chat_obj = user_chats[user_or_chat_id]
 
-    # запрос к API с семафором и бэкоффом
+    # Сохраняем запрос пользователя в SQLite
+    await add_message_to_db(user_or_chat_id, "user", prompt)
+
     attempt = 0
     backoff = 1.0
     last_exception = None
 
     async with GLOBAL_SEMAPHORE:
+        # Попытки обращения к Gemini
         while attempt < max_retries:
             attempt += 1
             try:
-                # SDK часто синхронный — вызываем в отдельном потоке, чтобы не блокировать цикл событий.
-                # Здесь не используем stream ипотеку по совместимости; если у вас SDK поддерживает stream
-                # вы можете заменить на итеративный сбор.
                 response = await asyncio.to_thread(chat_obj.send_message, prompt)
-                # ожидаем, что response имеет поле .text
-                text = getattr(response, "text", None)
-                if text is None:
-                    # попытка взять .content или str(response)
-                    text = str(response)
-                return text.strip()
+                text = getattr(response, "text", None) or str(response)
+                reply_text = text.strip()
+
+                # Сохраняем ответ модели в SQLite
+                await add_message_to_db(user_or_chat_id, "assistant", reply_text)
+                return reply_text
             except Exception as e:
-                logger.warning(f"Ошибка при запросе к Gemini (попытка {attempt}): {e}")
+                last_exception = e
+                logger.warning(f"Ошибка Gemini (попытка {attempt}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
 
-                return f"⚠️ Ошибка Gemini: {parse_gemini_error(e)}"
-        # если закончились попытки
-        return f"⚠️ Ошибка Gemini (после {max_retries} попыток): {last_exception}"
+        # 2. Если все попытки Gemini исчерпаны — срабатывает Fallback на Groq
+        logger.info(f"Gemini недоступен. Переключаюсь на Groq для {user_or_chat_id}")
+        try:
+            db_history = await get_history_from_db(user_or_chat_id, limit=8)
+            groq_messages = []
+            sys_prompt = get_system_prompt(chat_type)
+            if sys_prompt:
+                groq_messages.append({"role": "system", "content": sys_prompt})
+
+            for msg in db_history:
+                groq_messages.append({"role": msg["role"], "content": msg["content"]})
+
+            groq_response = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=groq_messages,
+                temperature=0.7
+            )
+            reply_text = groq_response.choices[0].message.content.strip()
+
+            # Сохраняем ответ Groq в историю базы
+            await add_message_to_db(user_or_chat_id, "assistant", reply_text)
+            return reply_text + "\n\n<i>(Ответил Groq, так как Gemini временно недоступен)</i>"
+        except Exception as groq_err:
+            logger.error(f"Ошибка резервного API Groq: {groq_err}")
+            return f"⚠️ Ошибка Gemini: {parse_gemini_error(last_exception)}\nРезервный API также недоступен."
 
 
-async def is_bot_relevant(user_or_chat_id, text: str, chat_type):
+async def is_bot_relevant(text: str):
+    """Изолированная проверка релевантности без засорения истории сессии"""
     prompt = (
-        f"Отвечать не нужно. Не сохраняй в памяти это. Просто проанализируй вопрос: {text}\n"
+        f"Проанализируй вопрос: {text}\n"
         f"{AI_PROMPT_IS_RELEVANT_QUESTION}\n"
         "Ответ должен быть только 'Да' или 'Нет'."
     )
-    reply = await ask_gemini(user_or_chat_id, prompt, chat_type)
-    return "да" in (reply or "").lower()
+    try:
+        model_obj = get_model_obj("gemini-2.5-flash")
+        response = await asyncio.to_thread(model_obj.generate_content, prompt)
+        reply = getattr(response, "text", "") or ""
+        return "да" in reply.lower()
+    except Exception as e:
+        logger.warning(f"Ошибка при проверке релевантности: {e}")
+        return False
 
+
+# ==========================================
+# ОБРАБОТЧИКИ TELEGRAM
+# ==========================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -207,34 +310,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = message.chat.type
     history_key = user_id if chat_type == "private" else chat_id
 
-    # Анти-спам: минимальный интервал между запросами от одного пользователя
-    now = datetime.utcnow()
+    # Анти-спам с поддержкой timezone-aware UTC
+    now = datetime.now(timezone.utc)
     last_time = last_request_time.get(history_key)
     if last_time and (now - last_time).total_seconds() < RATE_LIMIT_SECONDS_PER_USER:
-        # Молчим — либо отправляем короткую подсказку, можно не сообщать
         return
     last_request_time[history_key] = now
 
-    # определяем, отвечать ли: логика как у вас
-    silent = chat_id in last_request_time and False  # можно реализовать mute_until как у вас
-
     is_reply_to_bot = (
-        message.reply_to_message
-        and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.id == context.bot.id
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == context.bot.id
     )
 
     try:
-        # Решаем форму вопроса
         if chat_type != "private":
             if (f"@{context.bot.username.lower()}" in text.lower()) or is_reply_to_bot:
                 gemini_prompt = f"{user_id} пишет: {text}"
                 is_short = False
-            elif (("?" in text) and (not silent)
-                  and (not text.lower().startswith('@')) and (await is_bot_relevant(history_key, text, chat_type))):
+            elif ("?" in text) and (not text.lower().startswith('@')) and (await is_bot_relevant(text)):
                 gemini_prompt = f"{user_id} пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
-                # сохраняем для кнопки подробнее (если нужно)
-                # detailed_questions[message.message_id] = text
                 is_short = True
             else:
                 return
@@ -242,22 +337,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gemini_prompt = text
             is_short = False
 
-        # выбор модели (приоритет: для чата/пользователя, иначе DEFAULT_MODEL)
         selected_model = user_selected_model.get(history_key, DEFAULT_MODEL)
 
-        # создаём сообщение ожидания
-        wait_msg = await update.message.reply_text("⏳ Ждём ответ от модели...")
+        cancel_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Отмена", callback_data=f"cancel:{history_key}")
+        ]])
+        wait_msg = await update.message.reply_text("⏳ Ждём ответ от модели...", reply_markup=cancel_kb)
 
-        # запускаем фоновую задачу отправки typing
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(typing_sender(chat_id, context, stop_event))
 
-        # берём пер-пользовательский lock чтобы один пользователь не имел параллельных обращений
         user_lock = await ensure_user_lock(history_key)
-        async with user_lock:
-            # спрашиваем Gemini (ask_gemini выполняет свои retry и защищён семафором)
-            reply = await ask_gemini(history_key, gemini_prompt, chat_type, selected_model)
-        # завершили, отменяем typing и удаляем сообщение ожидания
+        gen_task = asyncio.create_task(ask_gemini(history_key, gemini_prompt, chat_type, selected_model))
+        active_tasks[history_key] = gen_task
+
+        try:
+            async with user_lock:
+                reply = await gen_task
+        except asyncio.CancelledError:
+            stop_event.set()
+            await wait_msg.edit_text("🛑 Генерация была отменена пользователем.")
+            return
+        finally:
+            active_tasks.pop(history_key, None)
+
         stop_event.set()
         typing_task.cancel()
 
@@ -265,15 +368,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await typing_task
         except asyncio.CancelledError:
             pass
+
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=wait_msg.message_id)
         except Exception:
-            # если не получилось удалить — игнорируем
             pass
 
-        # Отправка ответа
         if is_short:
-            # добавим кнопки "Тише" и "Подробнее" если нужно
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{message.message_id}"),
                 InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{message.message_id}:{user_id}")
@@ -291,96 +392,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# Кнопка "Подробнее" — аналог вашей реализации (упрощённо)
-async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
-        data = query.data  # format: more:<msg_id>:<user_id>
-        _, msg_id_str, original_user_id_str = data.split(':')
-        msg_id = int(msg_id_str)
-        original_user_id = int(original_user_id_str)
-
-        # Если у вас stored detailed_questions -> вернуть подробно
-        # Пример: если нет — ответим, что фича отключена
-        await query.message.reply_text("ℹ️ Подробные ответы включены в следующей версии.")
+        _, target_key = query.data.split(":")
+        target_key = int(target_key)
+        if target_key in active_tasks:
+            active_tasks[target_key].cancel()
+            await query.answer("Отменяю запрос...")
+        else:
+            await query.answer("Нет активной генерации.")
     except Exception as e:
-        logger.exception("Ошибка при обработке кнопки подробнее")
-        await query.message.reply_text("⚠️ Ошибка при обработке кнопки: " + str(e))
+        logger.exception("Ошибка в кнопке Отмена")
 
 
-# Тише (mute) — упрощённая версия
+async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("ℹ️ Подробные ответы включены в следующей версии.")
+
+
 async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
-        data = query.data  # format: silence:<chat_id>:<message_id>
-        # В этой демонстрации просто заменяем markup чтобы показать реакцию
         new_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Молчу 10 мин…", callback_data="noop")]])
         await query.edit_message_reply_markup(reply_markup=new_keyboard)
     except Exception as e:
         logger.exception("Ошибка в кнопке Тише")
-        try:
-            await query.message.reply_text("⚠️ Ошибка в кнопке Тише: " + str(e))
-        except Exception:
-            pass
 
 
-# Список команд /help
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "🤖 <b>Я — бот с ИИ на базе Gemini</b>\n\n"
+        "🤖 <b>Я — бот с ИИ на базе Gemini и Groq</b>\n\n"
         "Команды:\n"
         "/reset - сбросить контекст\n"
         "/model - выбрать модель\n"
-        "/help - показать это сообщение\n"
+        "/help - помощь\n"
     )
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 
-# /reset
 async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
+
+    # Очищаем базу данных и оперативную память
+    await clear_history_in_db(key)
     if key in user_chats:
         del user_chats[key]
-        await update.message.reply_text("🧼 Контекст сброшен!")
-    else:
-        await update.message.reply_text("ℹ️ Контекст уже пуст.")
+    await update.message.reply_text("🧼 Контекст сброшен из памяти и базы данных!")
 
 
-# /model - показывает доступные модели
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = []
-    for m in AVAILABLE_MODELS:
-        keyboard.append([InlineKeyboardButton(m, callback_data=f"set_model:{m}")])
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"set_model:{m}")] for m in AVAILABLE_MODELS]
     markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите модель для текущего чата/пользователя:", reply_markup=markup)
+    await update.message.reply_text("Выберите модель:", reply_markup=markup)
 
 
-# Обработчик выбора модели
 async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
-        data = query.data  # format set_model:<model_name>
-        _, model_name = data.split(":", 1)
+        _, model_name = query.data.split(":", 1)
         key = query.from_user.id if query.message.chat.type == 'private' else query.message.chat.id
         if model_name not in AVAILABLE_MODELS:
             await query.message.reply_text("❌ Модель недоступна.")
             return
 
-        # Сохраняем выбор
         user_selected_model[key] = model_name
-        # Сбрасываем контекст (рекомендуется при смене модели)
         if key in user_chats:
             del user_chats[key]
-        # Инициализируем кэш модели (лениво)
         get_model_obj(model_name)
-
         await query.message.reply_text(f"✅ Модель установлена: {model_name}")
     except Exception as e:
         logger.exception("Ошибка при выборе модели")
-        await query.message.reply_text("⚠️ Ошибка при выборе модели: " + str(e))
 
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,15 +474,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if member.id == context.bot.id:
             continue
         chat_id = update.effective_chat.id
-        username = member.full_name
-        prompt = (
-            f"В нашу группу присоединился новый участник по имени {username}. "
-            "Пришли один дружелюбный вариант приветствия от имени группы."
-        )
+        prompt = f"В группу вступил {member.full_name}. Напиши короткое дружелюбное приветствие."
         wait_msg = await update.message.reply_text("⏳ Генерирую приветствие...")
-        typing_task = asyncio.create_task(typing_sender(chat_id, context))
         reply = await ask_gemini(chat_id, prompt, chat_type="group")
-        typing_task.cancel()
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=wait_msg.message_id)
         except Exception:
@@ -404,27 +484,32 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(reply, parse_mode='HTML')
 
 
-async def set_commands(application):
+async def on_startup(application):
+    """Инициализация базы данных и команд бота при запуске"""
+    await init_db()
     commands = [
         BotCommand("reset", "Сбросить историю диалога"),
         BotCommand("help", "Показать список команд"),
-        BotCommand("model", "Выбрать модель Gemini"),
+        BotCommand("model", "Выбрать модель"),
     ]
     await application.bot.set_my_commands(commands)
 
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("reset", reset_history))
     app.add_handler(CommandHandler("help", show_help))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CallbackQueryHandler(set_model_callback, pattern="^set_model:"))
     app.add_handler(CallbackQueryHandler(silence_callback, pattern="^silence:"))
     app.add_handler(CallbackQueryHandler(expand_callback, pattern="^more:"))
+    app.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
-    app.post_init = set_commands
-    logger.info("Бот на Gemini запущен ✅")
+
+    app.post_init = on_startup
+    logger.info("Бот запущен ✅")
     app.run_polling()
 
 
