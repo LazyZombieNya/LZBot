@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import asyncio
+import html
 import json
 import re
 import base64
@@ -9,7 +10,6 @@ from datetime import datetime, timezone, timedelta
 import aiosqlite
 from dotenv import load_dotenv
 from telegram import ReactionTypeEmoji
-
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
@@ -22,6 +22,9 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
 )
+
+from access import init_billing_db, consume_request_and_check, grant_lifetime_access, add_subscription_days, \
+    check_subscription_expiring
 
 load_dotenv()
 
@@ -513,6 +516,131 @@ async def is_bot_relevant(text: str, chat_id: int):
 
 
 # ==========================================
+# БИЛЛИНГ И АДМИН-ПАНЕЛЬ
+# ==========================================
+
+async def zombie_allowed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрытая команда выдачи вечного доступа (только для админа)"""
+    if update.effective_user.id != ADMIN_ID:
+        return  # Если это не владелец, бот промолчит
+
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+
+    await grant_lifetime_access(chat_id, chat_type)
+    await update.message.reply_text("🧟‍♂️ <b>Доступ разрешен!</b>\nЭтому чату выдан вечный VIP-пропуск.",
+                                    parse_mode='HTML')
+
+
+async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+
+    # ❗️ ЗАМЕНИ номер телефона на свой реальный номер по СБП
+    text = (
+        "💳 <b>Оформление подписки</b>\n\n"
+        "Переведите нужную сумму по СБП (Сбер/Т-Банк) на номер:\n"
+        "<code>+7-922-720-12-55</code>\n\n"
+        "После перевода нажмите кнопку ниже, чтобы я отправил запрос на проверку."
+    )
+
+    # Бот понимает, где его вызвали, и предлагает нужный тариф
+    if chat_type != "private":
+        kb = [[InlineKeyboardButton("💵 Я оплатил 400₽ (Группа 30 дней)", callback_data=f"paid:group:{chat_id}")]]
+    else:
+        kb = [[InlineKeyboardButton("💵 Я оплатил 100₽ (Личный 30 дней)", callback_data=f"paid:private:{chat_id}")]]
+
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, tariff_type, chat_id_str = query.data.split(":")
+
+    user = query.from_user
+    user_name = user.full_name
+    # Достаем @никнейм, если он установлен у юзера
+    username_str = f" (@{user.username})" if user.username else ""
+    user_id = user.id
+
+    # Достаем название чата (если это группа)
+    chat = query.message.chat
+    chat_title_str = f"\nНазвание группы: <b>{chat.title}</b>" if chat.type != "private" else ""
+
+    await query.edit_message_text("⏳ Заявка отправлена администратору. Ожидайте подтверждения (обычно 5-15 минут).")
+
+    # Формируем расширенное сообщение ТЕБЕ В ЛИЧКУ
+    admin_text = (
+        f"💰 <b>НОВАЯ ЗАЯВКА НА ОПЛАТУ!</b>\n\n"
+        f"От кого: {user_name}{username_str} (ID: <code>{user_id}</code>)\n"
+        f"ID Чата: <code>{chat_id_str}</code>{chat_title_str}\n"
+        f"Тип тарифа: <b>{tariff_type.upper()}</b>\n\n"
+        f"Проверь баланс. Если деньги пришли, жми кнопку:"
+    )
+
+    admin_kb = [
+        [InlineKeyboardButton("✅ Подтвердить (Выдать 30 дней)",
+                              callback_data=f"admin_confirm:{chat_id_str}:{tariff_type}")],
+        [InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_reject:{chat_id_str}:{user_id}")]
+    ]
+
+    try:
+        # Отправляем сообщение на твой ADMIN_ID
+        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=InlineKeyboardMarkup(admin_kb),
+                                       parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
+
+
+async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Двойная защита: никто кроме тебя не сможет нажать эти кнопки
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    parts = query.data.split(":")
+    action = parts[0]
+    target_chat_id = int(parts[1])
+
+    # Сохраняем исходный текст заявки для истории и экранируем спецсимволы
+    safe_original_text = html.escape(query.message.text)
+
+    if action == "admin_confirm":
+        tariff_type = parts[2]
+        # Вызываем функцию начисления 30 дней!
+        await add_subscription_days(target_chat_id, tariff_type, 30)
+
+        # Оставляем заявку в истории как подтвержденную (reply_markup=None убирает кнопки)
+        new_text = f"✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА (30 дней)</b>\n\n<pre>{safe_original_text}</pre>"
+        await query.edit_message_text(new_text, parse_mode='HTML', reply_markup=None)
+
+        # Уведомляем клиента, что бот заработал
+        try:
+            await context.bot.send_message(chat_id=target_chat_id,
+                                           text="🎉 <b>Оплата подтверждена!</b>\nВам начислено 30 дней доступа к ИИ. Приятного общения!",
+                                           parse_mode='HTML')
+        except Exception:
+            pass
+
+    elif action == "admin_reject":
+        target_user_id = int(parts[2])  # Тот, кто нажал кнопку "Оплатил"
+
+        # Оставляем заявку в истории как отклоненную
+        new_text = f"❌ <b>ОПЛАТА ОТКЛОНЕНА</b>\n\n<pre>{safe_original_text}</pre>"
+        await query.edit_message_text(new_text, parse_mode='HTML', reply_markup=None)
+
+        try:
+            await context.bot.send_message(chat_id=target_chat_id,
+                                           text="❌ <b>Оплата не подтверждена.</b>\nЕсли вы перевели деньги, но заявка отклонена, свяжитесь с администратором @LazyZombie.",
+                                           parse_mode='HTML')
+        except Exception:
+            pass
+
+# ==========================================
 # ОБРАБОТЧИКИ TELEGRAM
 # ==========================================
 
@@ -569,6 +697,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     await query.edit_message_reply_markup(reply_markup=markup)
+
 async def get_keep_context(chat_key):
     """Возвращает статус передачи контекста (по умолчанию True)"""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -607,6 +736,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = message.chat.type
     history_key = user_id if chat_type == "private" else chat_id
 
+    is_reply_to_bot = (
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == context.bot.id
+    )
+
+    # ПРОВЕРКА ДОСТУПА (БИЛЛИНГ)
+    has_access = await consume_request_and_check(history_key, chat_type)
+    if not has_access:
+        # Если это личка - показываем меню оплаты. Если группа - просим админов оплатить.
+        tariff_msg = (
+            "⭐️ <b>Доступ ограничен</b>\n\n"
+            "Ваши пробные запросы закончились, или срок подписки истек. "
+            "Чтобы бот снова начал отвечать, необходимо оформить подписку. Введите /pay для просмотра тарифов."
+        )
+        # Отвечаем юзеру только если он напрямую тегнул бота или это личка,
+        # чтобы бот не спамил об оплате на каждое сообщение в группе
+        if is_reply_to_bot or chat_type == "private" or (f"@{context.bot.username.lower()}" in text.lower()):
+            await update.message.reply_text(tariff_msg, parse_mode='HTML')
+        return
+    # Проверяем, не заканчивается ли подписка в ближайшие дни
+    if await check_subscription_expiring(history_key):
+        await update.message.reply_text(
+            "⚠️ <b>Внимание!</b> Срок действия вашей подписки истекает в течение 3 дней.\n"
+            "Чтобы не потерять доступ, вы можете продлить её заранее через команду /pay.",
+            parse_mode='HTML'
+        )
+
+
     now = datetime.now(timezone.utc)
     last_time = last_request_time.get(history_key)
     if last_time and (now - last_time).total_seconds() < RATE_LIMIT_SECONDS_PER_USER:
@@ -630,12 +788,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Если это просто фото — прокомментируй его по-человечески. "
                 "СТРОГО ЗАПРЕЩЕНО использовать фразы вроде 'На картинке изображено', 'Я вижу', 'Здесь показано'. Отвечай естественно.]"
             )
-
-    is_reply_to_bot = (
-            message.reply_to_message
-            and message.reply_to_message.from_user
-            and message.reply_to_message.from_user.id == context.bot.id
-    )
 
     try:
         # --- ПРОВЕРКА СОСТОЯНИЯ ТИШИНЫ ---
@@ -925,7 +1077,8 @@ async def on_startup(application):
     except Exception as e:
         logger.critical(e)
         sys.exit(1)
-    await init_db()
+    await init_db() # База истории сообщений
+    await init_billing_db() # База подписок покупки
     commands = [
         BotCommand("reset", "Сбросить историю диалога"),
         BotCommand("help", "Показать список команд"),
@@ -951,6 +1104,10 @@ def main():
     app.add_handler(CommandHandler("help", show_help))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("setting", settings_command))
+    app.add_handler(CommandHandler("zombie_allowed", zombie_allowed_command))
+    app.add_handler(CommandHandler("pay", pay_command))
+    app.add_handler(CallbackQueryHandler(pay_callback, pattern="^paid:"))
+    app.add_handler(CallbackQueryHandler(admin_confirm_callback, pattern="^admin_(confirm|reject):"))
     app.add_handler(CallbackQueryHandler(set_model_callback, pattern="^set_model:"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^setting:"))
     app.add_handler(CallbackQueryHandler(silence_callback, pattern="^(silence|unsilence):"))
