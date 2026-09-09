@@ -4,9 +4,11 @@ import sys
 import asyncio
 import json
 import re
+import base64
 from datetime import datetime, timezone, timedelta
 import aiosqlite
 from dotenv import load_dotenv
+from telegram import ReactionTypeEmoji
 
 from google import genai
 from google.genai import types
@@ -220,8 +222,21 @@ def get_system_prompt(chat_type, user_name=""):
         base_prompt = AI_PROMPT_PM or ""
         if user_name:
             base_prompt += f"\n\n[Системная информация: собеседника зовут {user_name}]"
-        return base_prompt
-    return f"{AI_PROMPT_GM}\n{AI_PROMPT_TGM}"
+    else:
+        base_prompt = f"{AI_PROMPT_GM}\n{AI_PROMPT_TGM}"
+
+    # Секретная инструкция с правильным списком Telegram-реакций и разрешением на молчание
+    reaction_rule = (
+        "\n\n[СЕКРЕТНАЯ ИНСТРУКЦИЯ: Если ты считаешь уместным отреагировать на сообщение пользователя эмоцией, "
+        "начни свой ответ с тега [REACTION: эмодзи]. Безопасные разрешенные эмодзи: "
+        "👍, 👎, ❤️, 🔥, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🤡, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 😴, 😭, 🤓, 👻, 👀, 🤝, 🫡, 🗿. "
+        "\n❗️ ВАЖНО: Если сообщение пользователя не требует текстового ответа (например, это просто смешной мем, "
+        "фотография без контекста или подтверждение 'ок'/'понял'), ты ДОЛЖЕН ответить ТОЛЬКО тегом реакции (например, '[REACTION: 🤣]') "
+        "и больше ничего не писать. Не комментируй мемы текстом, если достаточно просто посмеяться реакцией!"
+        "Если реакция не нужна, просто пиши ответ без тега.]"
+    )
+
+    return base_prompt + reaction_rule
 
 
 def split_message(message: str):
@@ -267,11 +282,18 @@ async def typing_sender(chat_id: int, context: ContextTypes.DEFAULT_TYPE, stop_e
 # ОСНОВНАЯ ЛОГИКА ИИ
 # ==========================================
 
-async def query_gemini(model_id: str, history: list, sys_prompt: str) -> str:
+async def query_gemini(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
     contents = []
-    for msg in history:
+    for i, msg in enumerate(history):
         role = "model" if msg["role"] == "assistant" else "user"
-        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
+        parts = [types.Part.from_text(text=msg["content"])]
+
+        # Если есть картинка, прикрепляем её к последнему сообщению пользователя
+        if image_bytes and i == len(history) - 1 and role == "user":
+            parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+
+        contents.append(types.Content(role=role, parts=parts))
+
     config = types.GenerateContentConfig(system_instruction=sys_prompt if sys_prompt else None, temperature=0.7)
     response = await asyncio.wait_for(
         asyncio.to_thread(gemini_client.models.generate_content, model=model_id, contents=contents, config=config),
@@ -280,30 +302,49 @@ async def query_gemini(model_id: str, history: list, sys_prompt: str) -> str:
     return response.text.strip()
 
 
-async def query_groq(model_id: str, history: list, sys_prompt: str) -> str:
+async def query_groq(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    for i, msg in enumerate(history):
+        if image_bytes and i == len(history) - 1 and msg["role"] == "user":
+            b64_img = base64.b64encode(image_bytes).decode('utf-8')
+            content = [
+                {"type": "text", "text": msg["content"]},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+            ]
+            messages.append({"role": msg["role"], "content": content})
+        else:
+            messages.append({"role": msg["role"], "content": msg["content"]})
 
     response = await asyncio.wait_for(
         groq_client.chat.completions.create(
             model=model_id,
             messages=messages,
             temperature=0.7,
-            max_tokens=1000  # <--- Добавляем жесткий лимит для бесплатного тарифа
+            max_tokens=1000
         ),
         timeout=15.0
     )
     return response.choices[0].message.content.strip()
 
-async def query_openrouter(model_id: str, history: list, sys_prompt: str) -> str:
+
+async def query_openrouter(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    for i, msg in enumerate(history):
+        if image_bytes and i == len(history) - 1 and msg["role"] == "user":
+            b64_img = base64.b64encode(image_bytes).decode('utf-8')
+            content = [
+                {"type": "text", "text": msg["content"]},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+            ]
+            messages.append({"role": msg["role"], "content": content})
+        else:
+            messages.append({"role": msg["role"], "content": msg["content"]})
 
     response = await asyncio.wait_for(
         openrouter_client.chat.completions.create(
@@ -337,8 +378,11 @@ def parse_llm_error(error: Exception) -> str:
 
     return "Неизвестная ошибка API"
 
-async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str = ""):
-    await add_message_to_db(user_or_chat_id, "user", prompt)
+async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str = "", image_bytes: bytes = None):
+    # Помечаем в истории базы данных, что к тексту была прикреплена картинка
+    db_prompt = f"[Фото] {prompt}" if image_bytes else prompt
+    await add_message_to_db(user_or_chat_id, "user", db_prompt)
+
     history = await get_history_from_db(user_or_chat_id, limit=12)
     sys_prompt = get_system_prompt(chat_type, user_name)
 
@@ -364,11 +408,11 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
 
             try:
                 if provider == "gemini":
-                    reply_text = await query_gemini(model_id, history, sys_prompt)
+                    reply_text = await query_gemini(model_id, history, sys_prompt, image_bytes)
                 elif provider == "groq":
-                    reply_text = await query_groq(model_id, history, sys_prompt)
+                    reply_text = await query_groq(model_id, history, sys_prompt, image_bytes)
                 elif provider == "openrouter":
-                    reply_text = await query_openrouter(model_id, history, sys_prompt)
+                    reply_text = await query_openrouter(model_id, history, sys_prompt, image_bytes)
                 else:
                     continue
 
@@ -405,7 +449,13 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
 
 
 async def is_bot_relevant(text: str, chat_id: int):
-    prompt = f"Проанализируй вопрос: {text}\n{AI_PROMPT_IS_RELEVANT_QUESTION}\nОтвет должен быть только 'Да' или 'Нет'."
+    # Базовая защита: не дергаем API из-за одного символа "?"
+    if len(text.strip()) < 3:
+        return False
+
+    sys_prompt = AI_PROMPT_IS_RELEVANT_QUESTION
+    user_prompt = f"Вопрос: {text}"
+
     current_model_id = user_selected_model.get(chat_id)
     if not current_model_id:
         current_model_id = load_models_config()[0]["id"]
@@ -416,23 +466,49 @@ async def is_bot_relevant(text: str, chat_id: int):
         ordered_models = [ordered_models[0]]
 
     for model in ordered_models:
+        model_id = model["id"]
+        provider = model["provider"]
+
         try:
-            if model["provider"] == "gemini":
+            if provider == "gemini":
+                config = types.GenerateContentConfig(system_instruction=sys_prompt, temperature=0.1)
                 response = await asyncio.wait_for(
-                    asyncio.to_thread(gemini_client.models.generate_content, model=model["id"], contents=prompt),
+                    asyncio.to_thread(gemini_client.models.generate_content, model=model_id, contents=user_prompt,
+                                      config=config),
                     timeout=10.0
                 )
-                return "да" in response.text.lower()
-            elif model["provider"] == "groq":
+                # Очищаем от возможных <think> и ищем слово "да"
+                reply = sanitize_text(response.text)
+                return "да" in reply.lower()
+
+            elif provider == "groq":
                 response = await asyncio.wait_for(
-                    groq_client.chat.completions.create(model=model["id"],
-                                                        messages=[{"role": "user", "content": prompt}],
-                                                        temperature=0.1),
+                    groq_client.chat.completions.create(
+                        model=model_id,
+                        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                        temperature=0.1
+                    ),
                     timeout=10.0
                 )
-                return "да" in (response.choices[0].message.content or "").lower()
-        except Exception:
+                reply = sanitize_text(response.choices[0].message.content or "")
+                return "да" in reply.lower()
+
+            elif provider == "openrouter":  # БЛОК ДЛЯ OPENROUTER
+                response = await asyncio.wait_for(
+                    openrouter_client.chat.completions.create(
+                        model=model_id,
+                        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                        temperature=0.1
+                    ),
+                    timeout=10.0
+                )
+                reply = sanitize_text(response.choices[0].message.content or "")
+                return "да" in reply.lower()
+
+        except Exception as e:
+            logger.warning(f"Проверка релевантности: Модель {model_id} недоступна ({e}). Иду к следующей...")
             continue
+
     return False
 
 
@@ -516,13 +592,18 @@ async def toggle_keep_context(chat_key):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    if not message or not message.text:
+    # Разрешаем работу, если есть текст ИЛИ фото (caption)
+    if not message or (not message.text and not message.photo):
         return
 
     user_id = message.from_user.id
     user_name = message.from_user.first_name or "Пользователь"
     chat_id = message.chat_id
-    text = message.text.strip()
+
+    # Текст теперь может быть либо в .text, либо в .caption (подпись к фото)
+    text = message.text or message.caption or ""
+    text = text.strip()
+
     chat_type = message.chat.type
     history_key = user_id if chat_type == "private" else chat_id
 
@@ -531,6 +612,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last_time and (now - last_time).total_seconds() < RATE_LIMIT_SECONDS_PER_USER:
         return
     last_request_time[history_key] = now
+
+    # СКАЧИВАНИЕ КАРТИНКИ
+    image_bytes = None
+    if message.photo:
+        # Берем самую большую версию картинки [-1]
+        photo_file = await message.photo[-1].get_file()
+        image_bytes = bytes(await photo_file.download_as_bytearray())
+        # Если юзер скинул просто фото без текста, даем ИИ базовую команду
+        # Если юзер скинул просто фото без текста, даем ИИ скрытую системную инструкцию
+        if not text:
+            text = (
+                "[Системная пометка: Пользователь отправил картинку без текста. "
+                "Изучи её и отреагируй как живой участник чата. Обязательно учитывай наш предыдущий контекст диалога. "
+                "Если это мем или шутка — посмейся или ответь встречной шуткой. "
+                "Если текст или интерфейс на иностранном языке — помоги перевести или объясни суть. "
+                "Если это просто фото — прокомментируй его по-человечески. "
+                "СТРОГО ЗАПРЕЩЕНО использовать фразы вроде 'На картинке изображено', 'Я вижу', 'Здесь показано'. Отвечай естественно.]"
+            )
 
     is_reply_to_bot = (
             message.reply_to_message
@@ -553,9 +652,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Прямые упоминания и реплаи игнорируют тишину!
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
                 is_short = False
-            # ДОБАВИЛИ ПРОВЕРКУ "not is_silenced" ДЛЯ ВОПРОСОВ С "?"
+                # Если это фотка в группу без упоминания бота - игнорируем
             elif ("?" in text) and (not text.lower().startswith('@')) and (not is_silenced) and (
-            await is_bot_relevant(text, history_key)):
+                await is_bot_relevant(text, history_key)):
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
                 is_short = True
             else:
@@ -579,7 +678,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stop_event = asyncio.Event()
             typing_task = asyncio.create_task(typing_sender(chat_id, context, stop_event))
 
-            gen_task = asyncio.create_task(ask_llm(history_key, prompt_text, chat_type, user_name=user_name))
+            # ПЕРЕДАЕМ КАРТИНКУ В ask_llm
+            gen_task = asyncio.create_task(ask_llm(history_key, prompt_text, chat_type, user_name, image_bytes))
             active_tasks[history_key] = gen_task
 
             try:
@@ -603,6 +703,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.delete()
         except Exception:
             pass
+
+        # ПАРСИНГ РЕАКЦИИ ОТ ИИ
+        match = re.search(r'\[REACTION:\s*(.*?)\]', reply)
+        if match:
+            # Очищаем эмодзи от случайных пробелов
+            reaction_emoji = match.group(1).strip()
+            # Вырезаем тег из текста
+            reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply).strip()
+
+            try:
+                # Ставим реакцию
+                await message.set_reaction(reaction=[ReactionTypeEmoji(reaction_emoji)])
+            except Exception as e:
+                logger.warning(f"Не удалось поставить реакцию {reaction_emoji}: {e}")
+
+        if not reply:
+            return
 
         if is_short:
             keyboard = InlineKeyboardMarkup([[
@@ -839,7 +956,7 @@ def main():
     app.add_handler(CallbackQueryHandler(silence_callback, pattern="^(silence|unsilence):"))
     app.add_handler(CallbackQueryHandler(expand_callback, pattern="^more:"))
     app.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel:", block=False))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message, block=False))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
     app.post_init = on_startup
