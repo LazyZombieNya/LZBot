@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git
+.idea
+.vscode
+venv
+lib
+temp_data
+.env.example

@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+  bot:
+    build: .
+    container_name: ai_bot
+    restart: unless-stopped
+
+    environment:
+      - TELEGRAM_TOKEN = ${TELEGRAM_TOKEN}
+      - GEMINI_API_KEY = ${GEMINI_API_KEY}
+      - GROQ_API_KEY = ${GROQ_API_KEY}
+      - OPENROUTER_API_KEY = ${OPENROUTER_API_KEY}
+      - GROQ_URL=${GROQ_URL}
+      - ADMIN_ID = ${ADMIN_ID}
+      - SILENCE_MINUTES = ${SILENCE_MINUTES}
+
+      - AI_PROMPT_TGM=${AI_PROMPT_TGM}
+      - AI_PROMPT_PM=${AI_PROMPT_PM}
+      - AI_PROMPT_GM=${AI_PROMPT_GM}
+      - AI_PROMPT_IS_RELEVANT_QUESTION=${AI_PROMPT_IS_RELEVANT_QUESTION}
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Yekaterinburg
+
+    volumes:
+      # Прокидываем файлы, чтобы история не стиралась при пересборке
+      - /opt/lzbot/chat_history.db:/app/chat_history.db
+      - /opt/lzbot/billing.db:/app/billing.db
+      - /opt/lzbot/models.json:/app/models.json

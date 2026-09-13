@@ -23,8 +23,7 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-from access import init_billing_db, consume_request_and_check, grant_lifetime_access, add_subscription_days, \
-    check_subscription_expiring
+from access import init_billing_db, consume_request_and_check, grant_lifetime_access, add_subscription_days, get_and_mark_expiring_subscriptions
 
 load_dotenv()
 
@@ -117,6 +116,20 @@ async def init_db():
         except Exception:
             pass  # Колонка уже существует, всё ок
 
+        try: # Настройка отвечать на все
+            await db.execute("ALTER TABLE settings ADD COLUMN respond_all INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try: # Выбранная модель
+            await db.execute("ALTER TABLE settings ADD COLUMN selected_model TEXT")
+        except Exception:
+            pass
+        try: # тихий ответ
+            await db.execute("ALTER TABLE settings ADD COLUMN silent_responses INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+
         await db.commit()
 
 
@@ -176,6 +189,68 @@ async def clear_history_in_db(chat_key):
     except Exception as e:
         logger.error(f"Ошибка очистки БД: {e}")
 
+async def get_respond_all(chat_key):
+    """Возвращает статус режима 'Отвечать на всё' (по умолчанию False)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT respond_all FROM settings WHERE chat_key = ?", (str(chat_key),)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else False
+
+async def toggle_respond_all(chat_key):
+    """Переключает статус 'Отвечать на всё' и возвращает новое значение"""
+    current = await get_respond_all(chat_key)
+    new_val = 0 if current else 1
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+                         INSERT INTO settings (chat_key, respond_all)
+                         VALUES (?, ?) ON CONFLICT(chat_key) DO
+                         UPDATE SET respond_all = excluded.respond_all
+                         """, (str(chat_key), new_val))
+        await db.commit()
+    return bool(new_val)
+
+
+async def get_user_model(chat_key):
+    """Достает выбранную модель из БД. Если её нет - берет первую из конфига."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT selected_model FROM settings WHERE chat_key = ?", (str(chat_key),)) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+
+    # Если в базе пусто, отдаем модель по умолчанию
+    return load_models_config()[0]["id"]
+
+
+async def set_user_model(chat_key, model_id):
+    """Сохраняет выбранную модель в БД"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+                         INSERT INTO settings (chat_key, selected_model)
+                         VALUES (?, ?) ON CONFLICT(chat_key) DO
+                         UPDATE SET selected_model = excluded.selected_model
+                         """, (str(chat_key), model_id))
+        await db.commit()
+
+async def get_silent_responses(chat_key):
+    """Возвращает статус тихих ответов (по умолчанию False/со звуком)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT silent_responses FROM settings WHERE chat_key = ?", (str(chat_key),)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else False
+
+async def toggle_silent_responses(chat_key):
+    """Переключает статус тихих ответов"""
+    current = await get_silent_responses(chat_key)
+    new_val = 0 if current else 1
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+                         INSERT INTO settings (chat_key, silent_responses)
+                         VALUES (?, ?) ON CONFLICT(chat_key) DO
+                         UPDATE SET silent_responses = excluded.silent_responses
+                         """, (str(chat_key), new_val))
+        await db.commit()
+    return bool(new_val)
 
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И КОНФИГ
@@ -389,9 +464,7 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
     history = await get_history_from_db(user_or_chat_id, limit=12)
     sys_prompt = get_system_prompt(chat_type, user_name)
 
-    current_model_id = user_selected_model.get(user_or_chat_id)
-    if not current_model_id:
-        current_model_id = load_models_config()[0]["id"]
+    current_model_id = await get_user_model(user_or_chat_id)
 
     ordered_models = get_ordered_models(current_model_id)
 
@@ -425,7 +498,7 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
                 if model_id != current_model_id:
                     switched = True
                     new_model_name = model["name"]
-                    user_selected_model[user_or_chat_id] = model_id
+                    await set_user_model(user_or_chat_id, model_id)
 
                 await add_message_to_db(user_or_chat_id, "assistant", reply_text)
 
@@ -459,9 +532,7 @@ async def is_bot_relevant(text: str, chat_id: int):
     sys_prompt = AI_PROMPT_IS_RELEVANT_QUESTION
     user_prompt = f"Вопрос: {text}"
 
-    current_model_id = user_selected_model.get(chat_id)
-    if not current_model_id:
-        current_model_id = load_models_config()[0]["id"]
+    current_model_id = await get_user_model(chat_id)
 
     ordered_models = get_ordered_models(current_model_id)
     auto_fallback = await get_auto_fallback(chat_id)
@@ -640,6 +711,23 @@ async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
+
+async def check_expirations_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для проверки истекающих подписок"""
+    # Ищем тех, кому осталось 24 часа
+    expiring_chats = await get_and_mark_expiring_subscriptions(hours_left=24)
+
+    for chat_id_str in expiring_chats:
+        try:
+            await context.bot.send_message(
+                chat_id=int(chat_id_str),
+                text="⚠️ <b>Внимание!</b>\nСрок вашей подписки на ИИ-бота истекает менее чем через 24 часа. Чтобы не потерять доступ, вы можете заранее продлить его командой /pay",
+                parse_mode='HTML'
+            )
+            logger.info(f"Отправлено предупреждение об истечении подписки в чат {chat_id_str}")
+        except Exception as e:
+            logger.error(f"Не удалось отправить предупреждение {chat_id_str} (возможно, бот заблокирован): {e}")
+
 # ==========================================
 # ОБРАБОТЧИКИ TELEGRAM
 # ==========================================
@@ -651,21 +739,30 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
+
     auto_fallback = await get_auto_fallback(chat_key)
     keep_context = await get_keep_context(chat_key)
+    respond_all = await get_respond_all(chat_key)
+    silent_responses = await get_silent_responses(chat_key)  # Новое
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
+    btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
+    btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
-        [InlineKeyboardButton(btn2, callback_data="setting:keep_context")]
+        [InlineKeyboardButton(btn2, callback_data="setting:keep_context")],
+        [InlineKeyboardButton(btn3, callback_data="setting:respond_all")],
+        [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")]  # Новое
     ])
 
     await update.message.reply_text("⚙️ <b>Настройки чата:</b>", reply_markup=markup, parse_mode='HTML')
 
 
 """Обработчик кнопок меню настроек"""
+
+
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -676,24 +773,32 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_key = query.from_user.id if query.message.chat.type == 'private' else query.message.chat.id
 
-    # Определяем, какую именно кнопку нажали
     _, setting_type = query.data.split(":")
 
     if setting_type == "auto_fallback":
         await toggle_auto_fallback(chat_key)
     elif setting_type == "keep_context":
         await toggle_keep_context(chat_key)
+    elif setting_type == "respond_all":
+        await toggle_respond_all(chat_key)
+    elif setting_type == "silent_responses":  # Новое
+        await toggle_silent_responses(chat_key)
 
-    # Получаем актуальные статусы
     auto_fallback = await get_auto_fallback(chat_key)
     keep_context = await get_keep_context(chat_key)
+    respond_all = await get_respond_all(chat_key)
+    silent_responses = await get_silent_responses(chat_key)  # Новое
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
+    btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
+    btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"  # Новое
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
-        [InlineKeyboardButton(btn2, callback_data="setting:keep_context")]
+        [InlineKeyboardButton(btn2, callback_data="setting:keep_context")],
+        [InlineKeyboardButton(btn3, callback_data="setting:respond_all")],
+        [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")]  # Новое
     ])
 
     await query.edit_message_reply_markup(reply_markup=markup)
@@ -742,6 +847,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             and message.reply_to_message.from_user.id == context.bot.id
     )
 
+    # Получаем настройку тихих ответов перед отправкой
+    is_silent = await get_silent_responses(history_key)
+
     # ПРОВЕРКА ДОСТУПА (БИЛЛИНГ)
     has_access = await consume_request_and_check(history_key, chat_type)
     if not has_access:
@@ -756,13 +864,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_reply_to_bot or chat_type == "private" or (f"@{context.bot.username.lower()}" in text.lower()):
             await update.message.reply_text(tariff_msg, parse_mode='HTML')
         return
-    # Проверяем, не заканчивается ли подписка в ближайшие дни
-    if await check_subscription_expiring(history_key):
-        await update.message.reply_text(
-            "⚠️ <b>Внимание!</b> Срок действия вашей подписки истекает в течение 3 дней.\n"
-            "Чтобы не потерять доступ, вы можете продлить её заранее через команду /pay.",
-            parse_mode='HTML'
-        )
 
 
     now = datetime.now(timezone.utc)
@@ -804,9 +905,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Прямые упоминания и реплаи игнорируют тишину!
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
                 is_short = False
-                # Если это фотка в группу без упоминания бота - игнорируем
-            elif ("?" in text) and (not text.lower().startswith('@')) and (not is_silenced) and (
-                await is_bot_relevant(text, history_key)):
+            elif is_silenced:
+                # Если чат на паузе, игнорируем всё остальное
+                return
+            elif await get_respond_all(history_key):
+                # Если включен режим "Отвечать на всё", бот реагирует на каждое сообщение
+                prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
+                is_short = False
+            elif ("?" in text) and (not text.lower().startswith('@')) and (await is_bot_relevant(text, history_key)):
+                # Стандартный режим (только на вопросы)
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
                 is_short = True
             else:
@@ -825,7 +932,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with user_lock:
             cancel_kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🛑 Отмена", callback_data=f"cancel:{history_key}")]])
-            wait_msg = await update.message.reply_text("⏳ Ждём ответ...", reply_markup=cancel_kb)
+            wait_msg = await update.message.reply_text("⏳ Ждём ответ...", reply_markup=cancel_kb, disable_notification=True)
 
             stop_event = asyncio.Event()
             typing_task = asyncio.create_task(typing_sender(chat_id, context, stop_event))
@@ -878,10 +985,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{message.message_id}"),
                 InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{message.message_id}:{user_id}")
             ]])
-            await update.message.reply_text(reply, parse_mode='HTML', reply_markup=keyboard)
+            await update.message.reply_text(reply, parse_mode='HTML', reply_markup=keyboard,
+                                            disable_notification=is_silent)
         else:
             for part in split_message(reply):
-                await update.message.reply_text(part, parse_mode='HTML')
+                await update.message.reply_text(part, parse_mode='HTML', disable_notification=is_silent)
 
     except Exception as e:
         logger.exception("Ошибка в handle_message")
@@ -919,7 +1027,8 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wait_msg = await context.bot.send_message(
             chat_id=chat_id,
             text="⏳ Собираю подробный ответ...",
-            reply_to_message_id=original_msg_id
+            reply_to_message_id=original_msg_id,
+            disable_notification=True
         )
 
         # 2. Явно передаем этот текст нейросети, чтобы она знала, о чем речь
@@ -930,9 +1039,12 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply = await ask_llm(history_key, prompt, query.message.chat.type)
 
+        is_silent = await get_silent_responses(history_key)
+
         await wait_msg.delete()
         for part in split_message(reply):
-            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode='HTML')
+            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode='HTML',
+                                           disable_notification=is_silent)
 
     except Exception as e:
         logger.exception("Ошибка при обработке кнопки подробнее")
@@ -992,10 +1104,56 @@ async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка в silence_callback: {e}")
 
+
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = "🤖 <b>Я - бот с ИИ на базе Gemini, Groq, Openrouter</b>\n\nКоманды:\n/reset - сбросить контекст\n/model - выбрать модель\n/help - помощь\n"
+    user_id = update.effective_user.id
+
+    # Проверяем права на управление настройками (в ЛС всегда True, в группе - только админы)
+    can_change_settings = await check_admin_rights(update, context)
+
+    # 1. Базовая справка для всех
+    help_text = (
+        "🤖 <b>Умный ИИ-ассистент</b>\n\n"
+        "Я умею поддерживать диалог, запоминать контекст и <b>видеть картинки</b> (отправь фото с текстом или мем, и я пойму, что там изображено).\n\n"
+        "В группах я не влезаю в каждую беседу. Я отвечаю только если меня тегнуть, ответить на мое сообщение или задать осмысленный вопрос со знаком «?». А еще я умею реагировать эмодзи!\n\n"
+        "<b>Команды:</b>\n"
+        "🔹 /model — выбрать нейросеть (Gemini, Groq, OpenRouter)\n"
+        "🔹 /reset — начать диалог с чистого листа (сбросить память)\n"
+        "🔹 /pay — оформить или продлить подписку\n"
+        "🔹 /help — показать эту справку"
+    )
+
+    # 2. Блок настроек (видят пользователи в ЛС и админы в группах)
+    if can_change_settings:
+        help_text += (
+            "\n\n⚙️ <b>Настройки чата:</b>\n"
+            "🔹 /setting — управление режимами ИИ и памятью"
+        )
+
+    # 3. Секретный блок ВЛАДЕЛЬЦА (видишь только ТЫ)
+    if ADMIN_ID and user_id == ADMIN_ID:
+        help_text += (
+            "\n\n👑 <b>Управление биллингом (только для владельца):</b>\n"
+            "🧟‍♂️ /zombie_allowed — выдать текущему чату вечный VIP-доступ"
+        )
+
     await update.message.reply_text(help_text, parse_mode='HTML')
 
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name
+
+    welcome_text = (
+        f"Привет, <b>{user_name}</b>! 👋\n\n"
+        "Я — твой умный ИИ-помощник. Я умею поддерживать диалог, запоминать контекст нашей беседы и <b>видеть картинки</b> (просто скинь мне фото или мем!).\n\n"
+        "Напиши свой первый вопрос или отправь /help, чтобы посмотреть список команд."
+    )
+
+    # Добавляем инлайн-кнопку, чтобы сразу вовлечь пользователя
+    keyboard = [[InlineKeyboardButton("⚙️ Выбрать нейросеть",
+                                      callback_data="setting:models_placeholder")]]  # Можно просто направить на команду /model
+
+    await update.message.reply_text(welcome_text, parse_mode='HTML')
 
 async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
@@ -1029,9 +1187,9 @@ async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     _, model_id = query.data.split(":", 1)
     key = query.from_user.id if query.message.chat.type == 'private' else query.message.chat.id
-    # Сохраняем выбор пользователя
-    current_model_id = user_selected_model.get(key)
-    user_selected_model[key] = model_id
+    # Сохраняем выбор пользователя в БД
+    current_model_id = await get_user_model(key)
+    await set_user_model(key, model_id)
 
     # Проверяем настройку сохранения контекста
     keep_context = await get_keep_context(key)
@@ -1061,7 +1219,12 @@ async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         if member.id == context.bot.id: continue
-        prompt = f"В группу вступил {member.full_name}. Напиши короткое дружелюбное приветствие."
+        prompt = (
+            f"В нашу группу только что вступил пользователь по имени {member.full_name}. "
+            "Напиши для него очень короткое, креативное и теплое приветствие. "
+            "Обязательно используй 1-2 эмодзи. СТРОГОЕ ПРАВИЛО: твой ответ должен состоять максимум из 1 или 2 предложений. "
+            "Не задавай ему лишних вопросов и не пиши 'Привет, я искусственный интеллект'."
+        )
         wait_msg = await update.message.reply_text("⏳ Генерирую приветствие...")
         reply = await ask_llm(update.effective_chat.id, prompt, chat_type="group")
         try:
@@ -1100,6 +1263,12 @@ def main():
         .build()
     )
 
+    # === ЗАПУСК ФОНОВОЙ ПРОВЕРКИ ===
+    # Запускаем проверку каждые 3600 секунд (1 час).
+    # first=10 означает, что первая проверка пройдет через 10 секунд после старта бота
+    app.job_queue.run_repeating(check_expirations_job, interval=3600, first=10)
+
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("reset", reset_history))
     app.add_handler(CommandHandler("help", show_help))
     app.add_handler(CommandHandler("model", model_command))

@@ -1,8 +1,8 @@
-python-telegram-bot
-google-generativeai
+python-telegram-bot[job-queue]
+google-genai
+openai
 python-dotenv
 httpx
 aiohttp
 Pillow
-protobuf
 aiosqlite
