@@ -6,3 +6,7 @@ httpx
 aiohttp
 Pillow
 aiosqlite
+aiohttp
+beautifulsoup4
+youtube-transcript-api
+yt-dlp

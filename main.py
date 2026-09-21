@@ -13,7 +13,7 @@ from telegram import ReactionTypeEmoji
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, MessageEntity
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 
 from access import init_billing_db, consume_request_and_check, grant_lifetime_access, add_subscription_days, get_and_mark_expiring_subscriptions
+from web_parser import process_message_for_urls
 
 load_dotenv()
 
@@ -900,6 +901,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Если 10 минут прошло, удаляем чат из списка молчащих
                 del silenced_chats[chat_id]
 
+        # Вырезаем все ссылки из текста, чтобы проверить, есть ли там реальный вопрос
+        text_without_links = re.sub(r'https?://\S+', '', text).strip()
+        has_real_question = "?" in text_without_links
+
         if chat_type != "private":
             if (f"@{context.bot.username.lower()}" in text.lower()) or is_reply_to_bot:
                 # Прямые упоминания и реплаи игнорируют тишину!
@@ -912,8 +917,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Если включен режим "Отвечать на всё", бот реагирует на каждое сообщение
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
                 is_short = False
-            elif ("?" in text) and (not text.lower().startswith('@')) and (await is_bot_relevant(text, history_key)):
-                # Стандартный режим (только на вопросы)
+            # Проверяем наличие вопроса ТОЛЬКО в очищенном от ссылок тексте!
+            elif has_real_question and (not text.lower().startswith('@')) and (
+                await is_bot_relevant(text, history_key)):
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
                 is_short = True
             else:
@@ -937,8 +943,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stop_event = asyncio.Event()
             typing_task = asyncio.create_task(typing_sender(chat_id, context, stop_event))
 
-            # ПЕРЕДАЕМ КАРТИНКУ В ask_llm
-            gen_task = asyncio.create_task(ask_llm(history_key, prompt_text, chat_type, user_name, image_bytes))
+            # === МАГИЯ WEB-ПАРСЕРА ===
+            # Прогоняем текст через парсер ссылок перед отправкой в ИИ
+            enriched_prompt, parsed_image_bytes = await process_message_for_urls(prompt_text)
+
+            # Если юзер не прикрепил картинку напрямую в телегу, но кинул ссылку на неё - берем картинку по ссылке
+            final_image_bytes = image_bytes if image_bytes else parsed_image_bytes
+
+            # Передаем обогащенный промпт (с текстом сайтов) и картинку в LLM
+            gen_task = asyncio.create_task(
+                ask_llm(history_key, enriched_prompt, chat_type, user_name, final_image_bytes))
             active_tasks[history_key] = gen_task
 
             try:
