@@ -10,3 +10,6 @@ aiohttp
 beautifulsoup4
 youtube-transcript-api
 yt-dlp
+markdownify
+pymupdf
+python-docx

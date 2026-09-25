@@ -6,8 +6,11 @@ import html
 import json
 import re
 import base64
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 import aiosqlite
+import pymupdf
+import io
+from docx import Document
 from dotenv import load_dotenv
 from telegram import ReactionTypeEmoji
 from google import genai
@@ -24,6 +27,7 @@ from telegram.ext import (
 )
 
 from access import init_billing_db, consume_request_and_check, grant_lifetime_access, add_subscription_days, get_and_mark_expiring_subscriptions
+import web_parser
 from web_parser import process_message_for_urls
 
 load_dotenv()
@@ -306,13 +310,12 @@ def get_system_prompt(chat_type, user_name=""):
 
     # Секретная инструкция с правильным списком Telegram-реакций и разрешением на молчание
     reaction_rule = (
-        "\n\n[СЕКРЕТНАЯ ИНСТРУКЦИЯ: Если ты считаешь уместным отреагировать на сообщение пользователя эмоцией, "
-        "начни свой ответ с тега [REACTION: эмодзи]. Безопасные разрешенные эмодзи: "
-        "👍, 👎, ❤️, 🔥, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🤡, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 😴, 😭, 🤓, 👻, 👀, 🤝, 🫡, 🗿. "
-        "\n❗️ ВАЖНО: Если сообщение пользователя не требует текстового ответа (например, это просто смешной мем, "
-        "фотография без контекста или подтверждение 'ок'/'понял'), ты ДОЛЖЕН ответить ТОЛЬКО тегом реакции (например, '[REACTION: 🤣]') "
-        "и больше ничего не писать. Не комментируй мемы текстом, если достаточно просто посмеяться реакцией!"
-        "Если реакция не нужна, просто пиши ответ без тега.]"
+        "\n\n[СЕКРЕТНАЯ ИНСТРУКЦИЯ (СТРОГО): Если уместно отреагировать эмоцией, начни ответ с тега [REACTION: эмодзи]. "
+        "Разрешен ТОЛЬКО этот точный список эмодзи: "
+        "❤️, 👌, 👍, 😁, 🔥, 🤡, 🤣, 👎, 🥰, 👏, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 🕊️, 🥱, 🥴, 😍, 🐳, ❤️‍🔥, 🌚, 🌭, 💯, ⚡, 🍌, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 🖕, 😈, 😴, 😭, 🤓, 👻, 👨‍💻, 👀, 🎃, 🙈, 😇, 😨, 🤝, ✍️, 🤗, 🫡, 🎅, 🎄, ☃️, 💅, 🤪, 🗿, 🆒, 💘, 🙉, 🦄, 😘, 💊, 🙊, 😎, 👾, 🤷‍♂️, 🤷, 🤷‍♀️, 😡. "
+        "\n❗️ ПРАВИЛО ВЫЖИВАНИЯ: Если идеального эмодзи нет в этом списке — НЕ ПИШИ ТЕГ ВООБЩЕ. "
+        "Использование эмодзи вне списка ВЫЗЫВАЕТ КРИТИЧЕСКУЮ ОШИБКУ API ТЕЛЕГРАМА И ПОЛОМКУ БОТА. "
+        "Если текст ответа не нужен, отвечай ТОЛЬКО одним тегом из списка.]"
     )
 
     return base_prompt + reaction_rule
@@ -827,17 +830,87 @@ async def toggle_keep_context(chat_key):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    # Разрешаем работу, если есть текст ИЛИ фото (caption)
-    if not message or (not message.text and not message.photo):
+    if not message:
         return
 
     user_id = message.from_user.id
     user_name = message.from_user.first_name or "Пользователь"
     chat_id = message.chat_id
 
-    # Текст теперь может быть либо в .text, либо в .caption (подпись к фото)
     text = message.text or message.caption or ""
+
+    # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через Groq Whisper) ===
+    if message.voice or message.audio:
+        audio_obj = message.voice if message.voice else message.audio
+
+        if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("⚠️ Аудио слишком большое (лимит 20 МБ).")
+            return
+
+        file = await audio_obj.get_file()
+        audio_bytes = bytes(await file.download_as_bytearray())
+
+        wait_msg = await update.message.reply_text("🎧 Слушаю голосовое сообщение...", disable_notification=True)
+        try:
+            transcript = await groq_client.audio.transcriptions.create(
+                file=('audio.ogg', audio_bytes, 'audio/ogg'),
+                model="whisper-large-v3",
+                response_format="text"
+            )
+            # Добавляем явный контекст, чтобы ИИ понимал формат исходного сообщения
+            text = (
+                        text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript.strip()}").strip()
+            print(text)
+            await wait_msg.delete()
+        except Exception as e:
+            logger.error(f"Ошибка Whisper: {e}")
+            await wait_msg.edit_text("⚠️ Ошибка распознавания голоса.")
+            return
+
+    # === ОБРАБОТКА ПРИКРЕПЛЕННЫХ ФАЙЛОВ ===
+    elif message.document:
+        doc = message.document
+        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("⚠️ Файл слишком большой (лимит 20 МБ).")
+            return
+
+        wait_msg = await update.message.reply_text(f"📄 Читаю файл {doc.file_name}...", disable_notification=True)
+        try:
+            file = await doc.get_file()
+            file_bytes = bytes(await file.download_as_bytearray())
+
+            # Если это PDF
+            if doc.mime_type == 'application/pdf':
+                pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
+                doc_text = "".join([page.get_text() for page in pdf])
+                text += f"\n\n[Содержимое прикрепленного PDF файла {doc.file_name}]:\n{doc_text[:6000]}..."
+
+            # Если это Word документ (DOCX)
+            elif doc.file_name.lower().endswith('.docx'):
+                docx_file = io.BytesIO(file_bytes)
+                document = Document(docx_file)
+                doc_text = "\n".join([para.text for para in document.paragraphs])
+                text += f"\n\n[Содержимое прикрепленного Word документа {doc.file_name}]:\n{doc_text[:6000]}..."
+
+                # Если это текстовый файл, код или логи (.txt, .py, .log, .json и т.д.)
+            else:
+                try:
+                    doc_text = file_bytes.decode('utf-8')
+                    text += f"\n\n[Содержимое прикрепленного файла {doc.file_name}]:\n{doc_text[:6000]}..."
+                except UnicodeDecodeError:
+                    # Вместо pass добавляем системное сообщение для ИИ!
+                    text += f"\n\n[Системное сообщение: Пользователь прикрепил файл {doc.file_name}, но это неизвестный бинарный формат. Бот не смог извлечь из него текст. Сообщи об этом пользователю.]"
+                await wait_msg.delete()
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла: {e}")
+            await wait_msg.edit_text("⚠️ Ошибка при чтении файла.")
+            return
+
     text = text.strip()
+
+    # Финальная защита: если нет ни текста (включая извлеченный из файлов/голоса), ни картинки - выходим
+    if not text and not message.photo:
+        return
 
     chat_type = message.chat.type
     history_key = user_id if chat_type == "private" else chat_id
@@ -1247,6 +1320,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         await update.message.reply_text(reply, parse_mode='HTML')
 
+async def check_youtube_cookies_job(context: ContextTypes.DEFAULT_TYPE):
+    await web_parser.check_cookies_health()
 
 async def on_startup(application):
     try:
@@ -1254,6 +1329,7 @@ async def on_startup(application):
     except Exception as e:
         logger.critical(e)
         sys.exit(1)
+    web_parser.configure_admin_alerts(bot_token=TELEGRAM_TOKEN, admin_chat_id=ADMIN_ID)
     await init_db() # База истории сообщений
     await init_billing_db() # База подписок покупки
     commands = [
@@ -1281,6 +1357,7 @@ def main():
     # Запускаем проверку каждые 3600 секунд (1 час).
     # first=10 означает, что первая проверка пройдет через 10 секунд после старта бота
     app.job_queue.run_repeating(check_expirations_job, interval=3600, first=10)
+    app.job_queue.run_daily(check_youtube_cookies_job, time=time(hour=9, minute=0))
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("reset", reset_history))
@@ -1296,7 +1373,7 @@ def main():
     app.add_handler(CallbackQueryHandler(silence_callback, pattern="^(silence|unsilence):"))
     app.add_handler(CallbackQueryHandler(expand_callback, pattern="^more:"))
     app.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel:", block=False))
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message, block=False))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_message, block=False))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
     app.post_init = on_startup
