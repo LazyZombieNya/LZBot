@@ -25,3 +25,4 @@ services:
       - /opt/lzbot/chat_history.db:/app/chat_history.db
       - /opt/lzbot/billing.db:/app/billing.db
       - /opt/lzbot/models.json:/app/models.json
+      - /opt/lzbot/cookies.txt:/app/cookies.txt
