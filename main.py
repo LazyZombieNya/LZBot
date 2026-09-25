@@ -65,6 +65,7 @@ user_selected_model = {}
 last_request_time = {}
 GLOBAL_SEMAPHORE = asyncio.Semaphore(1)
 user_locks = {}
+user_buffers = {} # Переменная для накопления быстрых сообщений
 active_tasks = {}
 silenced_chats = {}  # здесь храним, до какого времени чат молчит
 
@@ -385,6 +386,11 @@ async def query_gemini(model_id: str, history: list, sys_prompt: str, image_byte
 
 
 async def query_groq(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
+    # Магия Groq: Если прикреплена картинка, а текущая модель не поддерживает зрение,
+    # временно и незаметно переключаем запрос на самую мощную vision-модель!
+    if image_bytes and "vision" not in model_id.lower():
+        model_id = "llama-3.2-90b-vision-preview"
+
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
@@ -836,12 +842,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = message.from_user.id
     user_name = message.from_user.first_name or "Пользователь"
     chat_id = message.chat_id
+    chat_type = message.chat.type
+    history_key = user_id if chat_type == "private" else chat_id
 
-    text = message.text or message.caption or ""
+    # --- НАЧАЛО: Группировка (буферизация) быстрых сообщений ---
+    if history_key not in user_buffers:
+        user_buffers[history_key] = []
+
+    user_buffers[history_key].append(message)
+    current_len = len(user_buffers[history_key])
+
+    # Ждем 1.5 секунды, чтобы собрать все сообщения из серии (пересылка + текст или фотоальбом)
+    await asyncio.sleep(1.5)
+
+    # Если список вырос за время ожидания, значит текущий поток не последний, уступаем выполнение
+    if len(user_buffers.get(history_key, [])) != current_len:
+        return
+
+    # Забираем все накопленные сообщения
+    messages = user_buffers.pop(history_key, [])
+
+    text = ""
+    media_msg = messages[-1]
+    is_reply_to_bot = False
+
+    # Склеиваем текст и ищем медиа со всех полученных сообщений
+    for msg in messages:
+        part_text = msg.text or msg.caption or ""
+        if part_text:
+            text += part_text + "\n\n"
+
+        if msg.photo or msg.document or msg.voice or msg.audio:
+            media_msg = msg
+
+        if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id:
+            is_reply_to_bot = True
+
+    text = text.strip()
+
+    # === МАГИЯ РЕПЛАЕВ И ПЕРЕСЫЛОК ===
+    if media_msg.reply_to_message:
+        replied_text = media_msg.reply_to_message.text or media_msg.reply_to_message.caption or ""
+        if replied_text:
+            if text:
+                text = f"{text}\n\n[Контекст из пересланного/отвеченного сообщения]:\n{replied_text}"
+            else:
+                text = f"[Пересланное/отвеченное сообщение]:\n{replied_text}"
+
+    # Умный поиск медиа в реплаях
+    if not (media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio) and media_msg.reply_to_message:
+        media_msg = media_msg.reply_to_message
 
     # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через Groq Whisper) ===
-    if message.voice or message.audio:
-        audio_obj = message.voice if message.voice else message.audio
+    if media_msg.voice or media_msg.audio:
+        audio_obj = media_msg.voice if media_msg.voice else media_msg.audio
 
         if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
             await update.message.reply_text("⚠️ Аудио слишком большое (лимит 20 МБ).")
@@ -868,8 +922,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # === ОБРАБОТКА ПРИКРЕПЛЕННЫХ ФАЙЛОВ ===
-    elif message.document:
-        doc = message.document
+    elif media_msg.document:
+        doc = media_msg.document
         if doc.file_size and doc.file_size > 20 * 1024 * 1024:
             await update.message.reply_text("⚠️ Файл слишком большой (лимит 20 МБ).")
             return
@@ -909,17 +963,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = text.strip()
 
     # Финальная защита: если нет ни текста (включая извлеченный из файлов/голоса), ни картинки - выходим
-    if not text and not message.photo:
+    if not text and not media_msg.photo:
         return
-
-    chat_type = message.chat.type
-    history_key = user_id if chat_type == "private" else chat_id
-
-    is_reply_to_bot = (
-            message.reply_to_message
-            and message.reply_to_message.from_user
-            and message.reply_to_message.from_user.id == context.bot.id
-    )
 
     # Получаем настройку тихих ответов перед отправкой
     is_silent = await get_silent_responses(history_key)
@@ -948,11 +993,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # СКАЧИВАНИЕ КАРТИНКИ
     image_bytes = None
-    if message.photo:
+    if media_msg.photo:
         # Берем самую большую версию картинки [-1]
-        photo_file = await message.photo[-1].get_file()
+        photo_file = await media_msg.photo[-1].get_file()  # <--- ИМЕННО MEDIA_MSG!
         image_bytes = bytes(await photo_file.download_as_bytearray())
-        # Если юзер скинул просто фото без текста, даем ИИ базовую команду
         # Если юзер скинул просто фото без текста, даем ИИ скрытую системную инструкцию
         if not text:
             text = (
