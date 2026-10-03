@@ -534,13 +534,13 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
     return f"⚠️ Все модели из списка временно недоступны.\nПоследняя ошибка: {switch_reason}"
 
 
-async def is_bot_relevant(text: str, chat_id: int):
+async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Пользователь"):
     # Базовая защита: не дергаем API из-за одного символа "?"
     if len(text.strip()) < 3:
         return False
 
     sys_prompt = AI_PROMPT_IS_RELEVANT_QUESTION
-    user_prompt = f"Вопрос: {text}"
+    user_prompt = f"Сообщение от пользователя {user_name}: {text}"
 
     current_model_id = await get_user_model(chat_id)
 
@@ -862,36 +862,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Забираем все накопленные сообщения
     messages = user_buffers.pop(history_key, [])
 
-    text = ""
-    media_msg = messages[-1]
+    user_text_only = ""
+    trigger_msg = messages[-1]
+    media_msg = trigger_msg
     is_reply_to_bot = False
+    is_reply_to_other = False
+    replied_human_name = ""
+
+    # Проверяем, является ли последнее сообщение реплаем
+    if trigger_msg.reply_to_message and trigger_msg.reply_to_message.from_user:
+        if trigger_msg.reply_to_message.from_user.id == context.bot.id:
+            is_reply_to_bot = True
+        else:
+            is_reply_to_other = True
+            replied_human_name = trigger_msg.reply_to_message.from_user.first_name or "пользователя"
 
     # Склеиваем текст и ищем медиа со всех полученных сообщений
     for msg in messages:
         part_text = msg.text or msg.caption or ""
         if part_text:
-            text += part_text + "\n\n"
+            user_text_only += part_text + "\n\n"
 
         if msg.photo or msg.document or msg.voice or msg.audio:
             media_msg = msg
 
-        if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id:
-            is_reply_to_bot = True
-
-    text = text.strip()
+    # Отделяем чистый текст юзера от будущего контекста с цитатами
+    user_text_only = user_text_only.strip()
+    text = user_text_only
 
     # === МАГИЯ РЕПЛАЕВ И ПЕРЕСЫЛОК ===
-    if media_msg.reply_to_message:
-        replied_text = media_msg.reply_to_message.text or media_msg.reply_to_message.caption or ""
+    if trigger_msg.reply_to_message:
+        replied_text = trigger_msg.reply_to_message.text or trigger_msg.reply_to_message.caption or ""
         if replied_text:
-            if text:
-                text = f"{text}\n\n[Контекст из пересланного/отвеченного сообщения]:\n{replied_text}"
+            if is_reply_to_bot:
+                prefix = "[В ответ на твое сообщение]"
             else:
-                text = f"[Пересланное/отвеченное сообщение]:\n{replied_text}"
+                prefix = f"[В ответ на сообщение от {replied_human_name}]"
+
+            if text:
+                text = f"{text}\n\n{prefix}:\n«{replied_text}»"
+            else:
+                text = f"{prefix}:\n«{replied_text}»"
 
     # Умный поиск медиа в реплаях
-    if not (media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio) and media_msg.reply_to_message:
-        media_msg = media_msg.reply_to_message
+    if not (
+            media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio) and trigger_msg.reply_to_message:
+        media_msg = trigger_msg.reply_to_message
 
     # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через Groq Whisper) ===
     if media_msg.voice or media_msg.audio:
@@ -960,12 +976,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.edit_text("⚠️ Ошибка при чтении файла.")
             return
 
-    text = text.strip()
-
-    # Финальная защита: если нет ни текста (включая извлеченный из файлов/голоса), ни картинки - выходим
-    if not text and not media_msg.photo:
-        return
-
     # Получаем настройку тихих ответов перед отправкой
     is_silent = await get_silent_responses(history_key)
 
@@ -979,8 +989,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Чтобы бот снова начал отвечать, необходимо оформить подписку. Введите /pay для просмотра тарифов."
         )
         # Отвечаем юзеру только если он напрямую тегнул бота или это личка,
-        # чтобы бот не спамил об оплате на каждое сообщение в группе
-        if is_reply_to_bot or chat_type == "private" or (f"@{context.bot.username.lower()}" in text.lower()):
+        # Проверяем ник бота только в чисто тексте юзера!
+        if is_reply_to_bot or chat_type == "private" or (
+                context.bot.username and f"@{context.bot.username.lower()}" in user_text_only.lower()):
             await update.message.reply_text(tariff_msg, parse_mode='HTML')
         return
 
@@ -1007,6 +1018,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Если это просто фото — прокомментируй его по-человечески. "
                 "СТРОГО ЗАПРЕЩЕНО использовать фразы вроде 'На картинке изображено', 'Я вижу', 'Здесь показано'. Отвечай естественно.]"
             )
+        else:
+            text += "\n\n[СИСТЕМНОЕ УВЕДОМЛЕНИЕ: К этому запросу прикреплено ИЗОБРАЖЕНИЕ. Обязательно проанализируй его!]"
+
+    # Финальная защита: если нет ни текста (включая извлеченный из файлов/голоса), ни картинки - выходим
+    if not text and not image_bytes:
+        return
 
     try:
         # --- ПРОВЕРКА СОСТОЯНИЯ ТИШИНЫ ---
@@ -1018,12 +1035,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Если 10 минут прошло, удаляем чат из списка молчащих
                 del silenced_chats[chat_id]
 
-        # Вырезаем все ссылки из текста, чтобы проверить, есть ли там реальный вопрос
-        text_without_links = re.sub(r'https?://\S+', '', text).strip()
+        # ВАЖНО: Вырезаем ссылки и ищем вопрос ТОЛЬКО в чистом тексте пользователя!
+        text_without_links = re.sub(r'https?://\S+', '', user_text_only).strip()
         has_real_question = "?" in text_without_links
 
+        is_mentioned = False
+        if context.bot.username:
+            # Ищем тег бота тоже ТОЛЬКО в тексте пользователя!
+            is_mentioned = f"@{context.bot.username.lower()}" in user_text_only.lower()
+
         if chat_type != "private":
-            if (f"@{context.bot.username.lower()}" in text.lower()) or is_reply_to_bot:
+            if is_mentioned or is_reply_to_bot:
                 # Прямые упоминания и реплаи игнорируют тишину!
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
                 is_short = False
@@ -1035,8 +1057,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
                 is_short = False
             # Проверяем наличие вопроса ТОЛЬКО в очищенном от ссылок тексте!
-            elif has_real_question and (not text.lower().startswith('@')) and (
-                await is_bot_relevant(text, history_key)):
+            # И ЖЕЛЕЗНОЕ ПРАВИЛО: не отвечаем на вопросы, адресованные другим людям (is_reply_to_other)
+            elif has_real_question and not is_reply_to_other and (
+            await is_bot_relevant(user_text_only, history_key, user_name)):
                 prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
                 is_short = True
             else:
