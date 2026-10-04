@@ -623,6 +623,74 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
 
     return False
 
+# ==========================================
+# КАСКАД МОДЕЛЕЙ ТРАНСКРИБАЦИИ АУДИО
+# ==========================================
+AUDIO_TRANSCRIBE_MODELS = [
+    {"provider": "groq", "model": "whisper-large-v3"},
+    {"provider": "groq", "model": "whisper-large-v3-turbo"},
+    {"provider": "gemini", "model": "gemini-2.5-flash"},
+    {"provider": "gemini", "model": "gemini-3.8-flash"},
+]
+
+async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """Универсальная транскрибация аудио с авто-переключением между Groq и Gemini."""
+    last_err = None
+
+    for item in AUDIO_TRANSCRIBE_MODELS:
+        provider = item["provider"]
+        model_name = item["model"]
+
+        try:
+            # 1. Попытка через Groq Whisper
+            if provider == "groq" and GROQ_API_KEY:
+                # Нормализуем расширение для заголовка Groq
+                ext = "ogg" if "ogg" in mime_type else "mp3"
+                transcript = await asyncio.wait_for(
+                    groq_client.audio.transcriptions.create(
+                        file=(f'audio.{ext}', audio_bytes, mime_type),
+                        model=model_name,
+                        response_format="text"
+                    ),
+                    timeout=20.0
+                )
+                text = transcript.strip() if isinstance(transcript, str) else getattr(transcript, "text", "").strip()
+                if text:
+                    return text
+
+            # 2. Резервная попытка через Google Gemini (нативное распознавание)
+            elif provider == "gemini" and GEMINI_API_KEY:
+                prompt = (
+                    "Сделай точную дословную расшифровку этого аудиосообщения на языке оригинала. "
+                    "Выведи ТОЛЬКО распознанный текст без каких-либо вводных слов, пояснений и кавычек."
+                )
+                contents = [
+                    types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                    prompt
+                ]
+                config = types.GenerateContentConfig(temperature=0.1)
+
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        gemini_client.models.generate_content,
+                        model=model_name,
+                        contents=contents,
+                        config=config
+                    ),
+                    timeout=25.0
+                )
+                text = (response.text or "").strip()
+                if text:
+                    logger.info(f"Аудио успешно распознано через резерв Gemini ({model_name}) ✅")
+                    return text
+
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Транскрибатор {provider}:{model_name} не сработал ({e}). Пробую следующую модель...")
+            continue
+
+    raise RuntimeError(f"Все аудио-модели из списка недоступны. Последняя ошибка: {last_err}")
+
 
 # ==========================================
 # БИЛЛИНГ И АДМИН-ПАНЕЛЬ
@@ -945,7 +1013,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio) and trigger_msg.reply_to_message:
         media_msg = trigger_msg.reply_to_message
 
-    # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через Groq Whisper) ===
+    # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через отказоустойчивый каскад) ===
     if media_msg.voice or media_msg.audio:
         audio_obj = media_msg.voice if media_msg.voice else media_msg.audio
 
@@ -956,21 +1024,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await audio_obj.get_file()
         audio_bytes = bytes(await file.download_as_bytearray())
 
-        wait_msg = await update.message.reply_text("🎧 Слушаю голосовое сообщение...", disable_notification=True)
+        # Определяем MIME-тип файла (для голоса в Telegram это audio/ogg)
+        mime_type = getattr(audio_obj, 'mime_type', None) or 'audio/ogg'
+
+        wait_msg = await update.message.reply_text("🎧 Слушаю аудио/голосовое...", disable_notification=True)
         try:
-            transcript = await groq_client.audio.transcriptions.create(
-                file=('audio.ogg', audio_bytes, 'audio/ogg'),
-                model="whisper-large-v3",
-                response_format="text"
-            )
+            # Вызываем каскад моделей (Groq Whisper v3 -> Whisper Turbo -> Gemini Flash)
+            transcript = await transcribe_audio(audio_bytes, mime_type=mime_type)
+
             # Добавляем явный контекст, чтобы ИИ понимал формат исходного сообщения
-            text = (
-                        text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript.strip()}").strip()
+            text = (text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript}").strip()
             print(text)
             await wait_msg.delete()
         except Exception as e:
-            logger.error(f"Ошибка Whisper: {e}")
-            await wait_msg.edit_text("⚠️ Ошибка распознавания голоса.")
+            logger.error(f"Ошибка каскада распознавания аудио: {e}")
+            await wait_msg.edit_text("⚠️ Ошибка распознавания голоса (все аудио-сервисы временно недоступны).")
             return
 
     # === ОБРАБОТКА ПРИКРЕПЛЕННЫХ ФАЙЛОВ ===
@@ -1423,6 +1491,99 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         await update.message.reply_text(reply, parse_mode='HTML')
 
+# Черный список подстрок: всё, что не является обычной текстовой/мультимодальной LLM
+GROQ_IGNORE_KEYWORDS = (
+    "whisper",
+    "guard",
+    "safeguard",
+    "orpheus",
+    "tts",
+    "embed",
+    "vision-preview",  # vision-модель вызывается ботом скрыто под капотом
+)
+
+def make_groq_display_name(model_id: str) -> str:
+    """Генерирует аккуратное имя для кнопок меню Telegram"""
+    clean = model_id.split("/")[-1]
+    # Убираем технические суффиксы
+    clean = clean.replace("-versatile", "").replace("-instant", "")
+    parts = clean.split("-")
+    short = " ".join([p.capitalize() for p in parts])
+    return f"⚡ GRQ: {short[:14]}"
+
+async def sync_groq_models():
+    """Синхронизирует активные модели Groq, сохраняя порядок Gemini и OpenRouter"""
+    if not GROQ_API_KEY:
+        return
+
+    try:
+        # 1. Получаем список живых моделей прямо от Groq
+        response = await groq_client.models.list()
+        active_groq_ids = []
+
+        for m in response.data:
+            m_id = m.id.lower()
+            # Пропускаем служебные модели, транскрибаторы и фильтры безопасности
+            if any(keyword in m_id for keyword in GROQ_IGNORE_KEYWORDS):
+                continue
+            # Если у модели есть признак активности — проверяем его
+            if getattr(m, "active", True):
+                active_groq_ids.append(m.id)
+
+        if not active_groq_ids:
+            return
+
+        # 2. Читаем текущий models.json
+        if not os.path.exists(MODELS_CONFIG_PATH):
+            return
+
+        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            current_models = json.load(f)
+
+        # 3. Разделяем модели на категории: до Groq (Gemini), сам Groq, и после (OpenRouter)
+        before_groq = []
+        existing_groq = {}
+        after_groq = []
+        groq_seen = False
+
+        for item in current_models:
+            if item.get("provider") == "groq":
+                groq_seen = True
+                existing_groq[item["id"]] = item
+            elif not groq_seen:
+                before_groq.append(item)
+            else:
+                after_groq.append(item)
+
+        # 4. Собираем актуальный список моделей Groq
+        updated_groq = []
+        for g_id in active_groq_ids:
+            if g_id in existing_groq:
+                # Если модель уже была в конфиге — сохраняем её привычное имя
+                updated_groq.append(existing_groq[g_id])
+            else:
+                # Если появилась новая модель — формируем для неё запись
+                updated_groq.append({
+                    "id": g_id,
+                    "name": make_groq_display_name(g_id),
+                    "provider": "groq"
+                })
+
+        # 5. Склеиваем всё обратно: [Gemini...] + [Актуальный Groq] + [OpenRouter...]
+        new_models_list = before_groq + updated_groq + after_groq
+
+        # Перезаписываем models.json только если состав реально изменился
+        if new_models_list != current_models:
+            with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(new_models_list, f, ensure_ascii=False, indent=2)
+            logger.info("models.json успешно обновлен: список моделей Groq актуализирован ✅")
+
+    except Exception as e:
+        logger.warning(f"Не удалось обновить список моделей Groq: {e}")
+
+async def sync_groq_models_job(context: ContextTypes.DEFAULT_TYPE):
+    await sync_groq_models()
+
 async def check_youtube_cookies_job(context: ContextTypes.DEFAULT_TYPE):
     await web_parser.check_cookies_health()
 
@@ -1435,6 +1596,7 @@ async def on_startup(application):
     web_parser.configure_admin_alerts(bot_token=TELEGRAM_TOKEN, admin_chat_id=ADMIN_ID)
     await init_db() # База истории сообщений
     await init_billing_db() # База подписок покупки
+    await sync_groq_models() # Обновление баз моделей Groq
     commands = [
         BotCommand("reset", "Сбросить историю диалога"),
         BotCommand("help", "Показать список команд"),
@@ -1461,6 +1623,7 @@ def main():
     # first=10 означает, что первая проверка пройдет через 10 секунд после старта бота
     app.job_queue.run_repeating(check_expirations_job, interval=3600, first=10)
     app.job_queue.run_daily(check_youtube_cookies_job, time=time(hour=9, minute=0))
+    app.job_queue.run_daily(sync_groq_models_job, time=time(hour=7, minute=00))
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("reset", reset_history))
