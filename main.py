@@ -134,10 +134,32 @@ async def init_db():
             await db.execute("ALTER TABLE settings ADD COLUMN silent_responses INTEGER DEFAULT 0")
         except Exception:
             pass
-
+        try: # показ технических деталей (переключение моделей)
+            await db.execute("ALTER TABLE settings ADD COLUMN show_tech_details INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
         await db.commit()
 
+async def get_show_tech_details(chat_key):
+    """Возвращает статус показа технических деталей (по умолчанию False/скрыто)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT show_tech_details FROM settings WHERE chat_key = ?", (str(chat_key),)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else False
+
+async def toggle_show_tech_details(chat_key):
+    """Переключает статус показа технических деталей"""
+    current = await get_show_tech_details(chat_key)
+    new_val = 0 if current else 1
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+                         INSERT INTO settings (chat_key, show_tech_details)
+                         VALUES (?, ?) ON CONFLICT(chat_key) DO
+                         UPDATE SET show_tech_details = excluded.show_tech_details
+                         """, (str(chat_key), new_val))
+        await db.commit()
+    return bool(new_val)
 
 async def get_auto_fallback(chat_key):
     """Возвращает статус авто-переключения (по умолчанию True)"""
@@ -513,9 +535,15 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
                 await add_message_to_db(user_or_chat_id, "assistant", reply_text)
 
                 if switched:
-                    # Добавляем причину падения предыдущей модели прямо в сообщение!
-                    reason_text = f" (причина: {switch_reason})" if switch_reason else ""
-                    reply_text = f"<i>⚠️ Переключено на <b>{new_model_name}</b>{reason_text}.</i>\n\n" + reply_text
+                    # Проверяем, хочет ли пользователь видеть технические детали сбоя
+                    show_tech = await get_show_tech_details(user_or_chat_id)
+                    if show_tech:
+                        # Добавляем причину падения предыдущей модели прямо в сообщение!
+                        reason_text = f" (причина: {switch_reason})" if switch_reason else ""
+                        reply_text = f"<i>⚠️ Переключено на <b>{new_model_name}</b>{reason_text}.</i>\n\n" + reply_text
+                    else:
+                        # Если скрыто - просто логируем в консоль для админа
+                        logger.info(f"Тихое авто-переключение для {user_or_chat_id} на {new_model_name} из-за {switch_reason}")
 
                 return reply_text
 
@@ -753,18 +781,21 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_fallback = await get_auto_fallback(chat_key)
     keep_context = await get_keep_context(chat_key)
     respond_all = await get_respond_all(chat_key)
-    silent_responses = await get_silent_responses(chat_key)  # Новое
+    silent_responses = await get_silent_responses(chat_key)
+    show_tech_details = await get_show_tech_details(chat_key)
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
+    btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"  # Новое
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
         [InlineKeyboardButton(btn2, callback_data="setting:keep_context")],
         [InlineKeyboardButton(btn3, callback_data="setting:respond_all")],
-        [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")]  # Новое
+        [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")],
+        [InlineKeyboardButton(btn5, callback_data="setting:show_tech_details")]
     ])
 
     await update.message.reply_text("⚙️ <b>Настройки чата:</b>", reply_markup=markup, parse_mode='HTML')
@@ -791,24 +822,29 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_keep_context(chat_key)
     elif setting_type == "respond_all":
         await toggle_respond_all(chat_key)
-    elif setting_type == "silent_responses":  # Новое
+    elif setting_type == "silent_responses":
         await toggle_silent_responses(chat_key)
+    elif setting_type == "show_tech_details":
+        await toggle_show_tech_details(chat_key)
 
     auto_fallback = await get_auto_fallback(chat_key)
     keep_context = await get_keep_context(chat_key)
     respond_all = await get_respond_all(chat_key)
-    silent_responses = await get_silent_responses(chat_key)  # Новое
+    silent_responses = await get_silent_responses(chat_key)
+    show_tech_details = await get_show_tech_details(chat_key)
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
-    btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"  # Новое
+    btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
+    btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
         [InlineKeyboardButton(btn2, callback_data="setting:keep_context")],
         [InlineKeyboardButton(btn3, callback_data="setting:respond_all")],
-        [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")]  # Новое
+        [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")],
+        [InlineKeyboardButton(btn5, callback_data="setting:show_tech_details")]
     ])
 
     await query.edit_message_reply_markup(reply_markup=markup)
