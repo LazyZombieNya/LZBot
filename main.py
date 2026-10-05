@@ -8,6 +8,7 @@ import re
 import base64
 from datetime import datetime, timezone, timedelta, time
 import aiosqlite
+import aiohttp
 import pymupdf
 import io
 from docx import Document
@@ -1491,6 +1492,191 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         await update.message.reply_text(reply, parse_mode='HTML')
 
+
+# Черный список для Gemini
+GEMINI_IGNORE_KEYWORDS = (
+    "vision", "image", "embed", "aqa", "tts", "live", "transcribe",
+    "bison", "gecko", "learnlm", "medlm", "veo", "lyria", "robotics"
+)
+
+
+def make_gemini_display_name(model_id: str, display_name: str) -> str:
+    """Генерирует аккуратное имя для кнопок меню Telegram"""
+    # Очищаем от мусора: "Gemini 3.5 Flash-Lite" -> "✨ GEM: 3.5 Flash-Lite"
+    name = display_name.replace("Gemini", "").replace("preview", "prev").replace("Experimental", "exp").strip()
+    return f"✨ GEM: {name[:14]}"
+
+
+def get_gemini_sort_score(model_id: str) -> float:
+    """Умная функция для оценки крутости модели (чем выше балл, тем выше в списке)"""
+    score = 0.0
+
+    # 1. Извлекаем номер версии (3.8, 3.5, 3, 2.5)
+    match = re.search(r'gemini-(\d+(?:\.\d+)?)', model_id)
+    if match:
+        score = float(match.group(1)) * 100  # Например, 3.8 -> 380 баллов
+
+    # 2. Штрафуем специфичные версии, чтобы выстроить идеальный порядок
+    if "lite" in model_id:
+        score -= 2  # Lite чуть ниже флагмана той же версии
+    if "pro" in model_id:
+        score -= 5  # Pro тяжелее и лимиты меньше, ставим после Flash
+    if "preview" in model_id or "exp" in model_id:
+        score -= 10  # Экспериментальные ставим ниже стабильных
+
+    return score
+
+
+async def sync_gemini_models():
+    """Синхронизирует актуальные текстовые модели Google Gemini"""
+    if not GEMINI_API_KEY:
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={GEMINI_API_KEY}"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Ошибка API Gemini при получении моделей: {resp.status}")
+                    return
+                data = await resp.json()
+                models_data = data.get("models", [])
+
+        active_gemini_models = []
+        for m in models_data:
+            full_name = m.get("name", "")
+            m_id = full_name.replace("models/", "")
+
+            methods = m.get("supportedGenerationMethods", [])
+            if "generateContent" not in methods:
+                continue
+
+            m_id_lower = m_id.lower()
+
+            # ЖЕСТКИЙ БЕЛЫЙ СПИСОК: берем только модели gemini, в которых есть flash или pro
+            if not m_id_lower.startswith("gemini-"):
+                continue
+            if "flash" not in m_id_lower and "pro" not in m_id_lower:
+                continue
+
+            # Исключаем служебные, аудио и робо-песочницы
+            if any(keyword in m_id_lower for keyword in GEMINI_IGNORE_KEYWORDS):
+                continue
+
+            display_name = m.get("displayName", m_id)
+            active_gemini_models.append({
+                "id": m_id,
+                "name": make_gemini_display_name(m_id, display_name),
+                "provider": "gemini",
+                "score": get_gemini_sort_score(m_id)  # Временное поле для сортировки
+            })
+
+        # Сортируем по нашему баллу (по убыванию)
+        active_gemini_models.sort(key=lambda x: x["score"], reverse=True)
+
+        # Убираем временное поле score и берем ТОП-8 лучших моделей
+        for m in active_gemini_models:
+            m.pop("score", None)
+
+        active_gemini_models = active_gemini_models[:10]
+
+        if not active_gemini_models:
+            return
+
+        if not os.path.exists(MODELS_CONFIG_PATH):
+            return
+
+        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            current_models = json.load(f)
+
+        # Вытаскиваем модели других провайдеров (Groq, OpenRouter), чтобы не затереть их
+        other_models = [m for m in current_models if m.get("provider") != "gemini"]
+
+        # Склеиваем: сначала новые правильные Gemini, потом всё остальное
+        new_models_list = active_gemini_models + other_models
+
+        # Сохраняем, только если есть реальные изменения
+        if new_models_list != current_models:
+            with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(new_models_list, f, ensure_ascii=False, indent=2)
+            logger.info("models.json успешно обновлен: список моделей Gemini актуализирован ✅")
+
+    except Exception as e:
+        logger.warning(f"Не удалось обновить список моделей Gemini: {e}")
+
+def make_or_display_name(model_id: str, name: str) -> str:
+    """Очищает имя модели OpenRouter от мусора, чтобы оно красиво влезло в кнопку"""
+    clean = name.replace("(free)", "").replace("Instruct", "").strip()
+    # Удаляем названия компаний в начале (например "Meta: Llama 3" -> "Llama 3")
+    if ":" in clean:
+        clean = clean.split(":", 1)[1].strip()
+    # Обрезаем длинные названия
+    return f"🔋 OR: {clean[:15]}"
+
+
+async def sync_openrouter_models():
+    """Синхронизирует ТОП-8 самых популярных бесплатных моделей OpenRouter"""
+    if not OPENROUTER_API_KEY:
+        return
+
+    try:
+        # Запрашиваем модели, отсортированные по популярности в мире
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://openrouter.ai/api/v1/models?sort=most-popular") as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+                models_data = data.get("data", [])
+
+        active_or_models = []
+        for m in models_data:
+            m_id = m.get("id", "")
+            pricing = m.get("pricing", {})
+
+            # Берем только 100% бесплатные модели
+            is_free = pricing.get("prompt") == "0" and pricing.get("completion") == "0"
+            if not is_free and not m_id.endswith(":free"):
+                continue
+
+            # Исключаем модели, которые мы уже используем напрямую,
+            # а также не-текстовые генераторы (например, картинки)
+            m_id_lower = m_id.lower()
+            if m_id_lower.startswith("google/") or m_id_lower.startswith("groq/"):
+                continue
+            if "vision" in m_id_lower or "image" in m_id_lower or "embed" in m_id_lower:
+                continue
+
+            active_or_models.append({
+                "id": m_id,
+                "name": make_or_display_name(m_id, m.get("name", "")),
+                "provider": "openrouter"
+            })
+
+            # Ограничиваемся ТОП-8 моделями, чтобы не разорвать экран телефона кнопками
+            if len(active_or_models) >= 8:
+                break
+
+        if not active_or_models:
+            return
+
+        if not os.path.exists(MODELS_CONFIG_PATH):
+            return
+
+        with open(MODELS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            current_models = json.load(f)
+
+        # Оставляем блоки Gemini и Groq как есть, а блок OpenRouter заменяем новым
+        before_or = [m for m in current_models if m.get("provider") != "openrouter"]
+        new_models_list = before_or + active_or_models
+
+        if new_models_list != current_models:
+            with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(new_models_list, f, ensure_ascii=False, indent=2)
+            logger.info("models.json успешно обновлен: ТОП-8 моделей OpenRouter актуализирован ✅")
+
+    except Exception as e:
+        logger.warning(f"Не удалось обновить список OpenRouter: {e}")
+
 # Черный список подстрок: всё, что не является обычной текстовой/мультимодальной LLM
 GROQ_IGNORE_KEYWORDS = (
     "whisper",
@@ -1581,8 +1767,11 @@ async def sync_groq_models():
     except Exception as e:
         logger.warning(f"Не удалось обновить список моделей Groq: {e}")
 
-async def sync_groq_models_job(context: ContextTypes.DEFAULT_TYPE):
-    await sync_groq_models()
+async def sync_api_models_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача: обновляет списки моделей всех провайдеров"""
+    await sync_gemini_models()     # Сначала обновляем Google
+    await sync_groq_models()       # Затем Groq
+    await sync_openrouter_models() # И в конце ТОП бесплатных из OpenRouter
 
 async def check_youtube_cookies_job(context: ContextTypes.DEFAULT_TYPE):
     await web_parser.check_cookies_health()
@@ -1596,7 +1785,9 @@ async def on_startup(application):
     web_parser.configure_admin_alerts(bot_token=TELEGRAM_TOKEN, admin_chat_id=ADMIN_ID)
     await init_db() # База истории сообщений
     await init_billing_db() # База подписок покупки
+    await sync_gemini_models() # Обновление баз моделей Gemini
     await sync_groq_models() # Обновление баз моделей Groq
+    await sync_openrouter_models() # Обновление баз моделей Openrouter
     commands = [
         BotCommand("reset", "Сбросить историю диалога"),
         BotCommand("help", "Показать список команд"),
@@ -1623,7 +1814,7 @@ def main():
     # first=10 означает, что первая проверка пройдет через 10 секунд после старта бота
     app.job_queue.run_repeating(check_expirations_job, interval=3600, first=10)
     app.job_queue.run_daily(check_youtube_cookies_job, time=time(hour=9, minute=0))
-    app.job_queue.run_daily(sync_groq_models_job, time=time(hour=7, minute=00))
+    app.job_queue.run_daily(sync_api_models_job, time=time(hour=7, minute=00))
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("reset", reset_history))
