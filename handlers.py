@@ -201,7 +201,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
-    btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"  # Новое
+    btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
@@ -351,7 +351,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         wait_msg = await update.message.reply_text("🎧 Слушаю аудио/голосовое...", disable_notification=True)
         try:
-            # Вызываем каскад моделей (Groq Whisper v3 -> Whisper Turbo -> Gemini Flash)
+            # Вызываем каскад моделей STT из ai_core
             transcript = await ai_core.transcribe_audio(audio_bytes, mime_type=mime_type)
 
             # Добавляем явный контекст, чтобы ИИ понимал формат исходного сообщения
@@ -628,7 +628,7 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("Ошибка при обработке кнопки подробнее")
-        await context.bot.send_message(chat_id=query.message.chat.id, text="⚠️️ Ошибка при формировании ответа.")
+        await context.bot.send_message(chat_id=query.message.chat.id, text="⚠ Ошибка при формировании ответа.")
 
 
 async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,8 +730,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Добавляем инлайн-кнопку, чтобы сразу вовлечь пользователя
-    keyboard = [[InlineKeyboardButton("⚙️ Выбрать нейросеть",
-                                      callback_data="setting:models_placeholder")]]  # Можно просто направить на команду /model
+    keyboard = [[InlineKeyboardButton("⚙️ Выбрать нейросеть", callback_data="setting:models_placeholder")]]
 
     await update.message.reply_text(welcome_text, parse_mode='HTML')
 
@@ -742,22 +741,25 @@ async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    models = database.load_models_config()
+    all_models = database.load_models_config()
 
-    # Задайте нужное количество столбцов (2 или 3)
+    # Оставляем только те модели, которые предназначены для выбора юзером (текстовые флагманы)
+    selectable_models = [m for m in all_models if m.get("selectable", True)]
+
+    # Задаем количество столбцов (2)
     COLUMNS = 2
 
     # Создаем плоский список всех кнопок
     buttons = [
         InlineKeyboardButton(m["name"], callback_data=f"set_model:{m['id']}")
-        for m in models
+        for m in selectable_models
     ]
 
     # Разбиваем список на строки по COLUMNS кнопок в каждой
     keyboard = [buttons[i:i + COLUMNS] for i in range(0, len(buttons), COLUMNS)]
 
     await update.message.reply_text(
-        "Выберите активную модель:",
+        "Выберите активную нейросеть:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 

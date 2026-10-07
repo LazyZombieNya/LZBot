@@ -27,7 +27,6 @@ def get_system_prompt(chat_type, user_name=""):
     else:
         base_prompt = f"{config.AI_PROMPT_GM}\n{config.AI_PROMPT_TGM}"
 
-    # Секретная инструкция с правильным списком Telegram-реакций и разрешением на молчание
     reaction_rule = (
         "\n\n[СЕКРЕТНАЯ ИНСТРУКЦИЯ (СТРОГО): Если уместно отреагировать эмоцией, начни ответ с тега [REACTION: эмодзи]. "
         "Разрешен ТОЛЬКО этот точный список эмодзи: "
@@ -36,21 +35,20 @@ def get_system_prompt(chat_type, user_name=""):
         "Использование эмодзи вне списка ВЫЗЫВАЕТ КРИТИЧЕСКУЮ ОШИБКУ API ТЕЛЕГРАМА И ПОЛОМКУ БОТА. "
         "Если текст ответа не нужен, отвечай ТОЛЬКО одним тегом из списка.]"
     )
-
     return base_prompt + reaction_rule
+
 
 def sanitize_text(text: str) -> str:
     """Вырезает теги <think> от DeepSeek и очищает текст от невалидного HTML"""
     if not text:
         return ""
-    # Вырезаем блок <think> ... </think> вместе с содержимым
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    # На всякий случай удаляем висячие теги, если модель их не закрыла
     text = text.replace('<think>', '').replace('</think>', '')
     return text.strip()
 
+
 # ==========================================
-# ОСНОВНАЯ ЛОГИКА ИИ
+# ОСНОВНЫЕ ЗАПРОСЫ К ПРОВАЙДЕРАМ
 # ==========================================
 
 async def query_gemini(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
@@ -59,7 +57,6 @@ async def query_gemini(model_id: str, history: list, sys_prompt: str, image_byte
         role = "model" if msg["role"] == "assistant" else "user"
         parts = [types.Part.from_text(text=msg["content"])]
 
-        # Если есть картинка, прикрепляем её к последнему сообщению пользователя
         if image_bytes and i == len(history) - 1 and role == "user":
             parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
 
@@ -74,11 +71,6 @@ async def query_gemini(model_id: str, history: list, sys_prompt: str, image_byte
 
 
 async def query_groq(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
-    # Магия Groq: Если прикреплена картинка, а текущая модель не поддерживает зрение,
-    # временно и незаметно переключаем запрос на самую мощную vision-модель!
-    if image_bytes and "vision" not in model_id.lower():
-        model_id = "llama-3.2-90b-vision-preview"
-
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
@@ -134,9 +126,7 @@ async def query_openrouter(model_id: str, history: list, sys_prompt: str, image_
 
 
 def parse_llm_error(error: Exception) -> str:
-    """Универсальный переводчик ошибок от любых API-провайдеров на человеческий язык"""
     err_str = str(error).lower()
-
     if "timeout" in err_str or "timed out" in err_str:
         return "Таймаут (превышено время ожидания)"
     elif any(x in err_str for x in ["not a valid model", "model_not_found", "does not exist", "404"]):
@@ -144,15 +134,39 @@ def parse_llm_error(error: Exception) -> str:
     elif any(x in err_str for x in ["rate-limited", "429", "too many requests", "quota exceeded"]):
         return "Истрачены лимиты или сервер временно перегружен"
     elif any(x in err_str for x in ["tokens", "too large", "maximum context"]):
-        return "Превышен лимит токенов (слишком длинная история)"
+        return "Превышен лимит токенов"
     elif any(x in err_str for x in ["api_key", "401", "403", "unauthorized"]):
         return "Ошибка авторизации (проверьте API-ключ)"
     elif any(x in err_str for x in ["500", "502", "503"]):
-        return "Сервер провайдера упал или высокая нагрузка на модель (ошибка 500+)"
+        return "Сервер провайдера упал или высокая нагрузка на модель"
     elif "400" in err_str or "invalid_argument" in err_str:
         return "Неверный формат запроса (Bad Request)"
-
     return "Неизвестная ошибка API"
+
+
+# ==========================================
+# ИНТЕЛЛЕКТУАЛЬНЫЙ РОУТИНГ
+# ==========================================
+
+def get_capable_models(required_capability: str, current_model_id: str):
+    """Возвращает список моделей, обладающих нужным навыком (text, image, audio).
+       Сначала подставляет текущую модель (если она умеет), затем все остальные подходящие.
+    """
+    all_models = database.load_models_config()
+    capable_models = [m for m in all_models if required_capability in m.get("capabilities", [])]
+
+    current_model = next((m for m in capable_models if m["id"] == current_model_id), None)
+    ordered = []
+
+    if current_model:
+        ordered.append(current_model)
+
+    for m in capable_models:
+        if m["id"] != current_model_id:
+            ordered.append(m)
+
+    return ordered
+
 
 async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str = "", image_bytes: bytes = None):
     # Помечаем в истории базы данных, что к тексту была прикреплена картинка
@@ -164,16 +178,28 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
 
     current_model_id = await database.get_user_model(user_or_chat_id)
 
-    ordered_models = database.get_ordered_models(current_model_id)
+    # 1. Анализируем контент и определяем, какой навык нужен
+    required_capability = "text"
+    if image_bytes:
+        required_capability = "image"
+    elif "[Аудио]:" in prompt:
+        required_capability = "audio"
 
-    # ПРОВЕРКА НАСТРОЙКИ ПЕРЕКЛЮЧЕНИЯ
+    # 2. Получаем только те модели, которые физически способны обработать этот контент
+    ordered_models = get_capable_models(required_capability, current_model_id)
+
+    if not ordered_models:
+        return f"⚠️ В списке доступных нейросетей нет ни одной модели, способной обработать этот тип данных (нужен навык: {required_capability})."
+
+    # 3. Если автопереключение выключено, мы можем использовать только ПЕРВУЮ модель из подходящих.
+    # Если юзер выбрал текстовую модель, а прислал картинку, первая подходящая модель будет ВРЕМЕННОЙ.
     auto_fallback = await database.get_auto_fallback(user_or_chat_id)
     if not auto_fallback:
-        ordered_models = [ordered_models[0]]  # Оставляем только текущую модель
+        ordered_models = [ordered_models[0]]
 
     switched = False
     new_model_name = ""
-    switch_reason = ""  # Переменная для хранения причины сбоя
+    switch_reason = ""
 
     async with config.GLOBAL_SEMAPHORE:
         for model in ordered_models:
@@ -190,46 +216,46 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
                 else:
                     continue
 
-                # Очищаем ответ от невалидных тегов ДО сохранения в базу и отправки
                 reply_text = sanitize_text(reply_text)
 
-                if model_id != current_model_id:
+                # Записываем смену модели только если это обычный текстовый запрос
+                # (Чтобы бот не переключился на vision-модель навсегда, если юзер просто скинул одну фотку)
+                if model_id != current_model_id and required_capability == "text":
                     switched = True
                     new_model_name = model["name"]
                     await database.set_user_model(user_or_chat_id, model_id)
+                elif model_id != current_model_id and required_capability != "text":
+                    # Для медиа-запросов мы не сохраняем модель в БД (временная маршрутизация),
+                    # но уведомляем юзера, что фото/аудио было обработано другой нейросетью.
+                    switched = True
+                    new_model_name = model["name"]
+                    switch_reason = f"текущая модель не поддерживает {required_capability}"
 
                 await database.add_message_to_db(user_or_chat_id, "assistant", reply_text)
 
                 if switched:
-                    # Проверяем, хочет ли пользователь видеть технические детали сбоя
                     show_tech = await database.get_show_tech_details(user_or_chat_id)
                     if show_tech:
-                        # Добавляем причину падения предыдущей модели прямо в сообщение!
                         reason_text = f" (причина: {switch_reason})" if switch_reason else ""
-                        reply_text = f"<i>⚠️ Переключено на <b>{new_model_name}</b>{reason_text}.</i>\n\n" + reply_text
+                        reply_text = f"<i>⚠️ Использована <b>{new_model_name}</b>{reason_text}.</i>\n\n" + reply_text
                     else:
-                        # Если скрыто - просто логируем в консоль для админа
-                        logger.info(f"Тихое авто-переключение для {user_or_chat_id} на {new_model_name} из-за {switch_reason}")
+                        logger.info(
+                            f"Временное переключение для {user_or_chat_id} на {new_model_name} из-за {switch_reason}")
 
                 return reply_text
 
             except Exception as e:
-                # 1. Прогоняем сырую ошибку через наш парсер
                 switch_reason = parse_llm_error(e)
-
-                # 2. Выводим в консоль сервера и красивую причину, и сырую ошибку для дебага
-                logger.warning(
-                    f"Модель {model_id} ({provider}) пропущена. Причина: {switch_reason} | Сырая ошибка: {e}")
+                logger.warning(f"Модель {model_id} ({provider}) пропущена. Причина: {switch_reason} | Ошибка: {e}")
                 continue
 
     if not auto_fallback:
-        return f"⚠️ Модель <b>{current_model_id}</b> временно недоступна ({switch_reason}).\nАвто-переключение отключено."
+        return f"⚠️ Модель временно недоступна ({switch_reason}).\nАвто-переключение отключено."
 
-    return f"⚠️️ Все модели из списка временно недоступны.\nПоследняя ошибка: {switch_reason}"
+    return f"⚠️ Все модели с поддержкой {required_capability} временно недоступны.\nПоследняя ошибка: {switch_reason}"
 
 
 async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Пользователь"):
-    # Базовая защита: не дергаем API из-за одного символа "?"
     if len(text.strip()) < 3:
         return False
 
@@ -237,8 +263,8 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
     user_prompt = f"Сообщение от пользователя {user_name}: {text}"
 
     current_model_id = await database.get_user_model(chat_id)
+    ordered_models = get_capable_models("text", current_model_id)
 
-    ordered_models = database.get_ordered_models(current_model_id)
     auto_fallback = await database.get_auto_fallback(chat_id)
     if not auto_fallback:
         ordered_models = [ordered_models[0]]
@@ -255,9 +281,7 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
                                       config=conf),
                     timeout=10.0
                 )
-                # Очищаем от возможных <think> и ищем слово "да"
-                reply = sanitize_text(response.text)
-                return "да" in reply.lower()
+                return "да" in sanitize_text(response.text).lower()
 
             elif provider == "groq":
                 response = await asyncio.wait_for(
@@ -268,10 +292,9 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
                     ),
                     timeout=10.0
                 )
-                reply = sanitize_text(response.choices[0].message.content or "")
-                return "да" in reply.lower()
+                return "да" in sanitize_text(response.choices[0].message.content or "").lower()
 
-            elif provider == "openrouter":  # БЛОК ДЛЯ OPENROUTER
+            elif provider == "openrouter":
                 response = await asyncio.wait_for(
                     openrouter_client.chat.completions.create(
                         model=model_id,
@@ -280,8 +303,7 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
                     ),
                     timeout=10.0
                 )
-                reply = sanitize_text(response.choices[0].message.content or "")
-                return "да" in reply.lower()
+                return "да" in sanitize_text(response.choices[0].message.content or "").lower()
 
         except Exception as e:
             logger.warning(f"Проверка релевантности: Модель {model_id} недоступна ({e}). Иду к следующей...")
@@ -289,28 +311,34 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
 
     return False
 
+
 # ==========================================
-# КАСКАД МОДЕЛЕЙ ТРАНСКРИБАЦИИ АУДИО
+# ТРАНСКРИБАЦИЯ АУДИО (ДИАЛОГОВЫЙ ПАРСЕР)
 # ==========================================
-AUDIO_TRANSCRIBE_MODELS = [
-    {"provider": "groq", "model": "whisper-large-v3"},
-    {"provider": "groq", "model": "whisper-large-v3-turbo"},
-    {"provider": "gemini", "model": "gemini-2.5-flash"},
-    {"provider": "gemini", "model": "gemini-3.8-flash"},
-]
 
 async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
-    """Универсальная транскрибация аудио с авто-переключением между Groq и Gemini."""
+    """Универсальная транскрибация аудио с авто-переключением по доступным аудио-моделям."""
     last_err = None
 
-    for item in AUDIO_TRANSCRIBE_MODELS:
+    # 1. Загружаем все модели, у которых в capabilities есть "audio" (это и STT типа Whisper, и мультимодалки)
+    all_models = database.load_models_config()
+    audio_models = [m for m in all_models if "audio" in m.get("capabilities", [])]
+
+    if not audio_models:
+        raise RuntimeError("В списке моделей нет ни одной с поддержкой аудио (STT).")
+
+    # 2. Сортируем: сначала быстрые специализированные STT модели от Groq (Whisper), затем остальные
+    whisper_models = [m for m in audio_models if "whisper" in m["id"].lower()]
+    other_models = [m for m in audio_models if "whisper" not in m["id"].lower()]
+    ordered_audio_models = whisper_models + other_models
+
+    for item in ordered_audio_models:
         provider = item["provider"]
-        model_name = item["model"]
+        model_name = item["id"]
 
         try:
-            # 1. Попытка через Groq Whisper
-            if provider == "groq" and config.GROQ_API_KEY:
-                # Нормализуем расширение для заголовка Groq
+            # Сценарий STT через Groq Whisper
+            if provider == "groq" and "whisper" in model_name.lower() and config.GROQ_API_KEY:
                 ext = "ogg" if "ogg" in mime_type else "mp3"
                 transcript = await asyncio.wait_for(
                     groq_client.audio.transcriptions.create(
@@ -321,34 +349,25 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
                     timeout=20.0
                 )
                 text = transcript.strip() if isinstance(transcript, str) else getattr(transcript, "text", "").strip()
-                if text:
-                    return text
+                if text: return text
 
-            # 2. Резервная попытка через Google Gemini (нативное распознавание)
+            # Сценарий STT через мультимодальные модели Google Gemini
             elif provider == "gemini" and config.GEMINI_API_KEY:
-                prompt = (
-                    "Сделай точную дословную расшифровку этого аудиосообщения на языке оригинала. "
-                    "Выведи ТОЛЬКО распознанный текст без каких-либо вводных слов, пояснений и кавычек."
-                )
-                contents = [
-                    types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                    prompt
-                ]
+                prompt = "Сделай точную дословную расшифровку этого аудиосообщения на языке оригинала. Выведи ТОЛЬКО распознанный текст без каких-либо вводных слов, пояснений и кавычек."
+                contents = [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt]
                 conf = types.GenerateContentConfig(temperature=0.1)
 
                 response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        gemini_client.models.generate_content,
-                        model=model_name,
-                        contents=contents,
-                        config=conf
-                    ),
+                    asyncio.to_thread(gemini_client.models.generate_content, model=model_name, contents=contents,
+                                      config=conf),
                     timeout=25.0
                 )
-                text = (response.text or "").strip()
-                if text:
-                    logger.info(f"Аудио успешно распознано через резерв Gemini ({model_name}) ✅")
-                    return text
+                if (response.text or "").strip():
+                    logger.info(f"Аудио успешно распознано через Gemini ({model_name}) ✅")
+                    return response.text.strip()
+
+            # Сценарий STT через мультимодальные модели OpenRouter (если в будущем понадобится)
+            # elif provider == "openrouter": pass
 
         except Exception as e:
             last_err = e
