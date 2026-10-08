@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import json
 import re
 from google import genai
 from google.genai import types
@@ -255,61 +256,81 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
     return f"⚠️ Все модели с поддержкой {required_capability} временно недоступны.\nПоследняя ошибка: {switch_reason}"
 
 
-async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Пользователь"):
+def parse_group_reply(raw: str):
+    """Неоднозначный/невалидный результат никогда не разрешает вмешательство."""
+    try:
+        result = json.loads(sanitize_text(raw))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(result, dict) or set(result) != {"action", "answer"}:
+        return None
+    if result["action"] != "answer" or not isinstance(result["answer"], str):
+        return None
+    answer = result["answer"].strip()
+    if not answer or len(answer) > 1000 or "[REACTION:" in answer:
+        return None
+    return answer
+
+
+async def prepare_group_reply(text: str, chat_id: int, user_name: str = "Пользователь"):
+    """Проверяет полезность и возвращает тот же готовый ответ, без второй генерации.
+
+    Отказ не запускает каскад: запасная модель нужна только при сбое API/протокола.
+    Ничего не записывает в историю и не меняет выбранную модель.
+    """
     if len(text.strip()) < 3:
-        return False
-
-    sys_prompt = config.AI_PROMPT_IS_RELEVANT_QUESTION
-    user_prompt = f"Сообщение от пользователя {user_name}: {text}"
-
+        return None
     current_model_id = await database.get_user_model(chat_id)
     ordered_models = get_capable_models("text", current_model_id)
+    if not await database.get_auto_fallback(chat_id):
+        ordered_models = ordered_models[:1]
+    if not ordered_models:
+        return None
 
-    auto_fallback = await database.get_auto_fallback(chat_id)
-    if not auto_fallback:
-        ordered_models = [ordered_models[0]]
+    history = await database.get_history_from_db(chat_id, limit=6)
+    user_prompt = json.dumps({
+        "history": [{"role": m["role"], "content": m["content"][:1500]} for m in history],
+        "sender": user_name, "message": text[:6000],
+    }, ensure_ascii=False)
+    sys_prompt = config.AI_PROMPT_GROUP_REPLY
 
-    for model in ordered_models:
-        model_id = model["id"]
-        provider = model["provider"]
-
-        try:
-            if provider == "gemini":
-                conf = types.GenerateContentConfig(system_instruction=sys_prompt, temperature=0.1)
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(gemini_client.models.generate_content, model=model_id, contents=user_prompt,
-                                      config=conf),
-                    timeout=10.0
-                )
-                return "да" in sanitize_text(response.text).lower()
-
-            elif provider == "groq":
-                response = await asyncio.wait_for(
-                    groq_client.chat.completions.create(
+    async with config.GLOBAL_SEMAPHORE:
+        for model in ordered_models:
+            model_id, provider = model["id"], model["provider"]
+            try:
+                if provider == "gemini":
+                    conf = types.GenerateContentConfig(system_instruction=sys_prompt, temperature=0.1)
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(gemini_client.models.generate_content,
+                                          model=model_id, contents=user_prompt, config=conf), timeout=10.0)
+                    raw = response.text
+                elif provider in ("groq", "openrouter"):
+                    client = groq_client if provider == "groq" else openrouter_client
+                    response = await asyncio.wait_for(client.chat.completions.create(
                         model=model_id,
-                        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
-                        temperature=0.1
-                    ),
-                    timeout=10.0
-                )
-                return "да" in sanitize_text(response.choices[0].message.content or "").lower()
+                        messages=[{"role": "system", "content": sys_prompt},
+                                  {"role": "user", "content": user_prompt}],
+                        temperature=0.1), timeout=10.0)
+                    raw = response.choices[0].message.content
+                else:
+                    continue
+                # Строгое чтение: слово «да» внутри другого слова больше не считается согласием.
+                result = json.loads(sanitize_text(raw))
+                if (isinstance(result, dict) and set(result) == {"action", "answer"}
+                        and result["action"] == "skip" and result["answer"] == ""):
+                    return None
+                answer = parse_group_reply(raw)
+                if answer is not None:
+                    return answer
+                logger.warning("Невалидный ответ маршрутизатора %s", model_id)
+            except Exception:
+                logger.warning("Ошибка проверки полезности: модель %s", model_id, exc_info=True)
+    return None
 
-            elif provider == "openrouter":
-                response = await asyncio.wait_for(
-                    openrouter_client.chat.completions.create(
-                        model=model_id,
-                        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
-                        temperature=0.1
-                    ),
-                    timeout=10.0
-                )
-                return "да" in sanitize_text(response.choices[0].message.content or "").lower()
 
-        except Exception as e:
-            logger.warning(f"Проверка релевантности: Модель {model_id} недоступна ({e}). Иду к следующей...")
-            continue
-
-    return False
+async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Пользователь"):
+    """Совместимость для старых вызовов. Обработчик использует prepare_group_reply."""
+    return await prepare_group_reply(text, chat_id, user_name) is not None
 
 
 # ==========================================

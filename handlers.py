@@ -271,22 +271,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = message.chat.type
     history_key = user_id if chat_type == "private" else chat_id
 
+    buffer_key = (history_key, user_id)
     # --- НАЧАЛО: Группировка (буферизация) быстрых сообщений ---
-    if history_key not in config.user_buffers:
-        config.user_buffers[history_key] = []
+    if buffer_key not in config.user_buffers:
+        config.user_buffers[buffer_key] = []
 
-    config.user_buffers[history_key].append(message)
-    current_len = len(config.user_buffers[history_key])
+    config.user_buffers[buffer_key].append(message)
+    current_len = len(config.user_buffers[buffer_key])
 
     # Ждем 1.5 секунды, чтобы собрать все сообщения из серии (пересылка + текст или фотоальбом)
     await asyncio.sleep(1.5)
 
     # Если список вырос за время ожидания, значит текущий поток не последний, уступаем выполнение
-    if len(config.user_buffers.get(history_key, [])) != current_len:
+    if len(config.user_buffers.get(buffer_key, [])) != current_len:
         return
 
     # Забираем все накопленные сообщения
-    messages = config.user_buffers.pop(history_key, [])
+    messages = config.user_buffers.pop(buffer_key, [])
 
     user_text_only = ""
     trigger_msg = messages[-1]
@@ -334,6 +335,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (
             media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio) and trigger_msg.reply_to_message:
         media_msg = trigger_msg.reply_to_message
+
+    # Решение принимается до скачивания медиа, списания запроса и любых сообщений ожидания.
+    prepared_reply = None
+    is_mentioned = bool(context.bot.username and re.search(
+        rf"(?<!\w)@{re.escape(context.bot.username)}(?!\w)", user_text_only, re.IGNORECASE))
+    if chat_type != "private" and not (is_mentioned or is_reply_to_bot):
+        silence_until = config.silenced_chats.get(chat_id)
+        if silence_until and datetime.now(timezone.utc) < silence_until:
+            return
+        config.silenced_chats.pop(chat_id, None)
+        if not await database.get_respond_all(history_key):
+            text_without_links = re.sub(r'https?://\S+', '', user_text_only).strip()
+            if is_reply_to_other or "?" not in text_without_links:
+                return
+            # Без запроса к боту не анализируем вложения и не гадаем по их подписи.
+            if media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio:
+                return
+            last_time = config.last_request_time.get(history_key)
+            if last_time and (datetime.now(timezone.utc) - last_time).total_seconds() < config.RATE_LIMIT_SECONDS_PER_USER:
+                return
+            user_lock = await ensure_user_lock(history_key)
+            if user_lock.locked():
+                return
+            async with user_lock:
+                prepared_reply = await ai_core.prepare_group_reply(user_text_only, history_key, user_name)
+            if prepared_reply is None:
+                return
 
     # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через отказоустойчивый каскад) ===
     if media_msg.voice or media_msg.audio:
@@ -452,47 +480,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # --- ПРОВЕРКА СОСТОЯНИЯ ТИШИНЫ ---
-        is_silenced = False
-        if chat_id in config.silenced_chats:
-            if datetime.now(timezone.utc) < config.silenced_chats[chat_id]:
-                is_silenced = True
-            else:
-                # Если 10 минут прошло, удаляем чат из списка молчащих
-                del config.silenced_chats[chat_id]
-
-        # ВАЖНО: Вырезаем ссылки и ищем вопрос ТОЛЬКО в чистом тексте пользователя!
-        text_without_links = re.sub(r'https?://\S+', '', user_text_only).strip()
-        has_real_question = "?" in text_without_links
-
-        is_mentioned = False
-        if context.bot.username:
-            # Ищем тег бота тоже ТОЛЬКО в тексте пользователя!
-            is_mentioned = f"@{context.bot.username.lower()}" in user_text_only.lower()
-
-        if chat_type != "private":
-            if is_mentioned or is_reply_to_bot:
-                # Прямые упоминания и реплаи игнорируют тишину!
-                prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
-                is_short = False
-            elif is_silenced:
-                # Если чат на паузе, игнорируем всё остальное
-                return
-            elif await database.get_respond_all(history_key):
-                # Если включен режим "Отвечать на всё", бот реагирует на каждое сообщение
-                prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
-                is_short = False
-            # Проверяем наличие вопроса ТОЛЬКО в очищенном от ссылок тексте!
-            # И ЖЕЛЕЗНОЕ ПРАВИЛО: не отвечаем на вопросы, адресованные другим людям (is_reply_to_other)
-            elif has_real_question and not is_reply_to_other and (
-            await ai_core.is_bot_relevant(user_text_only, history_key, user_name)):
-                prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}\n\nОтветь кратко, 1-2 предложениями."
-                is_short = True
-            else:
-                return
-        else:
+        is_short = prepared_reply is not None
+        if chat_type == "private":
             prompt_text = text
-            is_short = False
+        else:
+            prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
+
+        if is_short:
+            # Ответ уже проверен и подготовлен; не просим другую модель отвечать заново.
+            reply = html.escape(prepared_reply)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{trigger_msg.message_id}"),
+                InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{trigger_msg.message_id}:{user_id}")
+            ]])
+            await trigger_msg.reply_text(reply, parse_mode='HTML', reply_markup=keyboard,
+                                         disable_notification=is_silent)
+            await database.add_message_to_db(history_key, "user", prompt_text)
+            await database.add_message_to_db(history_key, "assistant", prepared_reply)
+            return
 
         user_lock = await ensure_user_lock(history_key)
 
@@ -695,7 +700,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🤖 <b>Умный ИИ-ассистент</b>\n\n"
         "Я умею поддерживать диалог, запоминать контекст и <b>видеть картинки</b> (отправь фото с текстом или мем, и я пойму, что там изображено).\n\n"
-        "В группах я не влезаю в каждую беседу. Я отвечаю только если меня тегнуть, ответить на мое сообщение или задать осмысленный вопрос со знаком «?». А еще я умею реагировать эмодзи!\n\n"
+        "В группах я не влезаю в каждую беседу. Я отвечаю только если меня тегнуть, ответить на мое сообщение или задать вопрос со знаком «?», на который у меня есть полезный ответ. Если данных не хватает, я молчу. А еще я умею реагировать эмодзи!\n\n"
         "<b>Команды:</b>\n"
         "🔹 /model — выбрать нейросеть (Gemini, Groq, OpenRouter)\n"
         "🔹 /reset — начать диалог с чистого листа (сбросить память)\n"
