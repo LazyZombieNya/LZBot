@@ -316,6 +316,7 @@ async def prepare_group_reply(text: str, chat_id: int, user_name: str = "Пол�
                     continue
                 # Строгое чтение: слово «да» внутри другого слова больше не считается согласием.
                 result = json.loads(sanitize_text(raw))
+                print(f"Ответ нейронки на вопрос Short: {result}")
                 if (isinstance(result, dict) and set(result) == {"action", "answer"}
                         and result["action"] == "skip" and result["answer"] == ""):
                     return None

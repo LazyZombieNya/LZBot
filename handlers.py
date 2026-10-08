@@ -804,18 +804,36 @@ async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # 1. Достаем последние 5-6 сообщений из базы для контекста
+    history = await database.get_history_from_db(chat_id, limit=6)
+    history_text = "\n".join([f"{msg['role']}: {msg['content'][:100]}" for msg in history])
+    if not history_text:
+        history_text = "В чате пока тихо."
+
     for member in update.message.new_chat_members:
-        if member.id == context.bot.id: continue
+        if member.id == context.bot.id:
+            continue
+
+        # 2. Формируем умный промпт
         prompt = (
-            f"В нашу группу только что вступил пользователь по имени {member.full_name}. "
-            "Напиши для него очень короткое, креативное и теплое приветствие. "
-            "Обязательно используй 1-2 эмодзи. СТРОГОЕ ПРАВИЛО: твой ответ должен состоять максимум из 1 или 2 предложений. "
-            "Не задавай ему лишних вопросов и не пиши 'Привет, я искусственный интеллект'."
+            f"В нашу группу только что вступил новый пользователь по имени {member.full_name}. "
+            "Напиши для него очень короткое, креативное и теплое приветствие (1-2 предложения). "
+            "Обязательно используй 1-2 эмодзи.\n\n"
+            "СЕКРЕТНАЯ ИНСТРУКЦИЯ:\n"
+            f"Вот о чем мы общались в чате прямо перед его приходом:\n<chat_history>\n{history_text}\n</chat_history>\n"
+            "Кратко упомяни в приветствии текущую тему разговора, чтобы вовлечь его в беседу (например: 'Мы тут как раз обсуждаем X, присоединяйся!'). "
+            "Не задавай лишних вопросов, не пиши 'Привет, я ИИ'. Будь как живой участник беседы."
         )
-        wait_msg = await update.message.reply_text("⏳ Генерирую приветствие...")
-        reply = await ai_core.ask_llm(update.effective_chat.id, prompt, chat_type="group")
+
+        wait_msg = await update.message.reply_text("⏳ Генерирую приветствие...", disable_notification=True)
+        # Отправляем запрос в ядро
+        reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group")
+
         try:
             await wait_msg.delete()
         except Exception:
             pass
+
         await update.message.reply_text(reply, parse_mode='HTML')
