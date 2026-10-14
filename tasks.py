@@ -17,86 +17,126 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # В API Google нет поля modalities, поэтому мы жестко исключаем служебные модели.
 GEMINI_IGNORE_KEYWORDS = (
-    "embed", "aqa", "bison", "gecko", "learnlm", "medlm", "robotics"
+    "embed", "aqa", "bison", "gecko", "learnlm", "medlm", "robotics",
+    "computer-use", "antigravity", "deep-research", "customtools", "veo", "omni"
 )
 
 
 def make_gemini_display_name(display_name: str) -> str:
-    name = display_name.replace("Gemini", "").replace("preview", "prev").replace("Experimental", "exp").strip()
-    return f"✨ GEM: {name[:14]}"
-
+    name = display_name.replace("Gemini", "").replace("Preview", "Prev").replace("preview", "prev").replace("Experimental", "Exp").strip()
+    return f"✨ GEM: {name[:15]}"
 
 def get_gemini_sort_score(model_id: str) -> float:
+    """Оценивает модель для выстраивания идеальной очереди фолбэка и меню."""
     score = 0.0
     match = re.search(r'gemini-(\d+(?:\.\d+)?)', model_id)
-    if match: score = float(match.group(1)) * 100
-    if "lite" in model_id: score -= 2
-    if "pro" in model_id: score -= 5
-    if "preview" in model_id or "exp" in model_id: score -= 10
+    if match:
+        score = float(match.group(1)) * 100
+
+    # Приоритет внутри одного поколения: Argon -> Flash -> Pro -> Flash-Lite
+    if "argon" in model_id:
+        score += 15
+    if "pro" in model_id:
+        score -= 3
+    if "lite" in model_id:
+        score -= 6
+
+    # Preview и экспериментальные версии опускаем ниже стабильных релизов
+    if "preview" in model_id or "exp" in model_id:
+        score -= 40
+
     return score
 
 
 async def sync_gemini_models():
-    if not config.GEMINI_API_KEY: return
+    if not config.GEMINI_API_KEY:
+        return
 
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={config.GEMINI_API_KEY}"
             async with session.get(url) as resp:
-                if resp.status != 200: return
+                if resp.status != 200:
+                    return
                 models_data = (await resp.json()).get("models", [])
 
         parsed_models = []
+        seen_base_ids = set()
+
+        # Сначала сортируем сырой список так, чтобы стабильные версии шли перед preview
+        models_data.sort(key=lambda x: ("preview" in x.get("name", ""), x.get("name", "")))
+
         for m in models_data:
             m_id = m.get("name", "").replace("models/", "")
+            m_id_lower = m_id.lower()
 
-            # Пропускаем модели, которые ничего не генерируют
+            # 1. Берем ТОЛЬКО модели с поддержкой стандартного generateContent
+            # (Чистые Live-модели с bidiGenerateContent требуют WebSocket и роняют обычный API-вызов)
             methods = m.get("supportedGenerationMethods", [])
-            if "generateContent" not in methods and "bidiGenerateContent" not in methods:
+            if "generateContent" not in methods:
                 continue
 
-            m_id_lower = m_id.lower()
+            # 2. Игнорируем спец-агентов, роботов и алиасы "-latest" (чтобы не плодить дубли в меню)
             if any(keyword in m_id_lower for keyword in GEMINI_IGNORE_KEYWORDS):
                 continue
+            if m_id_lower.endswith("-latest"):
+                continue
+
+            # 3. Защита от дублей: если уже есть стабильная "gemini-3.1-flash-lite",
+            # то старую "gemini-3.1-flash-lite-preview" пропускаем
+            base_id = m_id_lower.replace("-preview", "").replace("-exp", "")
+            if base_id in seen_base_ids and ("preview" in m_id_lower or "exp" in m_id_lower):
+                continue
+            seen_base_ids.add(base_id)
 
             capabilities = []
-            selectable = False
+            is_chat_candidate = False
 
-            # Определяем возможности по названию
-            if "gemini-" in m_id_lower and ("flash" in m_id_lower or "pro" in m_id_lower):
-                if "tts" in m_id_lower:
-                    capabilities = ["text", "audio_out"]
-                elif "live" in m_id_lower or "transcribe" in m_id_lower:
-                    capabilities = ["audio", "text"]
-                elif "image" in m_id_lower:
-                    capabilities = ["text", "image", "image_out"]
-                else:
-                    # Обычные флагманы умеют всё
-                    capabilities = ["text", "image", "audio", "video"]
-                    selectable = True
-            elif "nano-banana" in m_id_lower:
-                capabilities = ["text", "image_out"]
+            # 4. Распределяем возможности
+            if "tts" in m_id_lower:
+                capabilities = ["text", "audio_out"]
+            elif "transcribe" in m_id_lower:
+                capabilities = ["audio", "text"]
+            elif "image" in m_id_lower or "nano-banana" in m_id_lower:
+                capabilities = ["text", "image", "image_out"]
             elif "lyria" in m_id_lower:
                 capabilities = ["audio_out"]
+            elif m_id_lower.startswith("gemma-"):
+                # Открытые модели Gemma оставляем в резерве (только текст/картинки)
+                capabilities = ["text", "image"]
             else:
-                continue
+                # Все основные модели Gemini (4 Argon, 3.8..3.0 Flash/Pro, 2.5 Flash/Pro)
+                capabilities = ["text", "image", "audio", "video"]
+                is_chat_candidate = True
 
             parsed_models.append({
                 "id": m_id,
                 "name": make_gemini_display_name(m.get("displayName", m_id)),
                 "provider": "gemini",
                 "capabilities": capabilities,
-                "selectable": selectable,
-                "score": get_gemini_sort_score(m_id) if selectable else 0.0
+                "selectable": False,  # Включим ниже для ТОП-10
+                "is_chat_candidate": is_chat_candidate,
+                "score": get_gemini_sort_score(m_id) if is_chat_candidate else -1000.0
             })
 
-        # Оставляем только ТОП-8 для меню (selectable=True), остальные (служебные) просто храним в базе
-        selectable_models = sorted([m for m in parsed_models if m["selectable"]], key=lambda x: x["score"],
-                                   reverse=True)[:8]
-        service_models = [m for m in parsed_models if not m["selectable"]]
+        # Сортируем кандидатов по нашему рейтингу (от 4 Argon до 2.5 Flash-Lite)
+        chat_models = sorted(
+            [m for m in parsed_models if m["is_chat_candidate"]],
+            key=lambda x: x["score"],
+            reverse=True
+        )
+        service_models = [m for m in parsed_models if not m["is_chat_candidate"]]
 
-        active_gemini_models = selectable_models + service_models
-        for m in active_gemini_models: m.pop("score", None)
+        # Первые 10 лучших моделей показываем в меню /model (туда войдут и 4 Argon, и 3.x, и 2.5 Flash),
+        # а остальные чат-модели оставляем в базе как скрытый резерв (selectable=False)
+        for i, m in enumerate(chat_models):
+            if i < 10:
+                m["selectable"] = True
+
+        active_gemini_models = chat_models + service_models
+        for m in active_gemini_models:
+            m.pop("score", None)
+            m.pop("is_chat_candidate", None)
 
         await _update_json_config("gemini", active_gemini_models)
 

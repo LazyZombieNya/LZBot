@@ -551,16 +551,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ПАРСИНГ РЕАКЦИИ ОТ ИИ
         match = re.search(r'\[REACTION:\s*(.*?)\]', reply)
         if match:
-            # Очищаем эмодзи от случайных пробелов
             reaction_emoji = match.group(1).strip()
-            # Вырезаем тег из текста
             reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply).strip()
 
-            try:
-                # Ставим реакцию
-                await message.set_reaction(reaction=[ReactionTypeEmoji(reaction_emoji)])
-            except Exception as e:
-                logger.warning(f"Не удалось поставить реакцию {reaction_emoji}: {e}")
+            if reaction_emoji in ai_core.ALLOWED_REACTIONS:
+                try:
+                    await message.set_reaction(reaction=[ReactionTypeEmoji(reaction_emoji)])
+                except Exception as e:
+                    logger.warning(f"Не удалось поставить реакцию {reaction_emoji}: {e}")
+            else:
+                logger.debug(f"ИИ попытался поставить неподдерживаемую реакцию: {reaction_emoji} (проигнорировано)")
 
         if not reply:
             return
@@ -806,34 +806,52 @@ async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # 1. Достаем последние 5-6 сообщений из базы для контекста
+    # 1. Достаем последние 6 сообщений из базы для контекста
     history = await database.get_history_from_db(chat_id, limit=6)
     history_text = "\n".join([f"{msg['role']}: {msg['content'][:100]}" for msg in history])
     if not history_text:
         history_text = "В чате пока тихо."
 
+    is_silent = await database.get_silent_responses(chat_id)
+
     for member in update.message.new_chat_members:
         if member.id == context.bot.id:
             continue
 
-        # 2. Формируем умный промпт
+        # 2. Формируем промпт без конфликтующих заголовков
         prompt = (
-            f"В нашу группу только что вступил новый пользователь по имени {member.full_name}. "
-            "Напиши для него очень короткое, креативное и теплое приветствие (1-2 предложения). "
-            "Обязательно используй 1-2 эмодзи.\n\n"
-            "СЕКРЕТНАЯ ИНСТРУКЦИЯ:\n"
-            f"Вот о чем мы общались в чате прямо перед его приходом:\n<chat_history>\n{history_text}\n</chat_history>\n"
-            "Кратко упомяни в приветствии текущую тему разговора, чтобы вовлечь его в беседу (например: 'Мы тут как раз обсуждаем X, присоединяйся!'). "
-            "Не задавай лишних вопросов, не пиши 'Привет, я ИИ'. Будь как живой участник беседы."
+            f"[Системное событие: в группу вступил новый участник {member.full_name}].\n"
+            "Напиши для него короткое, креативное и теплое приветствие на 1-2 предложения (можно со смайликами в тексте). "
+            "Не используй тег [REACTION] в этом ответе.\n"
+            f"Для контекста — вот о чем общались в чате прямо перед его приходом:\n<chat_history>\n{history_text}\n</chat_history>\n"
+            "Если в истории обсуждается какая-то тема, забавно и кратко упомяни её в приветствии, чтобы сразу ввести человека в курс дела. "
+            "Не пиши 'Привет, я ИИ' и не задавай скучных вопросов."
         )
 
         wait_msg = await update.message.reply_text("⏳ Генерирую приветствие...", disable_notification=True)
-        # Отправляем запрос в ядро
-        reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group")
+        # save_to_history=False не дает техническому промпту записаться в память как реплика юзера
+        reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
 
         try:
             await wait_msg.delete()
         except Exception:
             pass
 
-        await update.message.reply_text(reply, parse_mode='HTML')
+        if not reply:
+            continue
+
+        # 3. Если модель всё равно добавила тег [REACTION], аккуратно вырезаем его
+        match = re.search(r'\[REACTION:\s*(.*?)\]', reply)
+        if match:
+            reaction_emoji = match.group(1).strip()
+            reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply).strip()
+
+            # Ставим реакцию ТОЛЬКО если эмодзи реально существует в белом списке Telegram
+            if reaction_emoji in ai_core.ALLOWED_REACTIONS:
+                try:
+                    await update.message.set_reaction(reaction=[ReactionTypeEmoji(reaction_emoji)])
+                except Exception as e:
+                    logger.warning(f"Не удалось поставить реакцию {reaction_emoji}: {e}")
+
+        if reply:
+            await update.message.reply_text(reply, parse_mode='HTML', disable_notification=is_silent)

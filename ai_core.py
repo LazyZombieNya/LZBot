@@ -20,6 +20,15 @@ openrouter_client = AsyncOpenAI(
 gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
 groq_client = AsyncOpenAI(api_key=config.GROQ_API_KEY, base_url=config.GROQ_URL)
 
+# Точный список эмодзи, которые разрешены Telegram API для реакций ботов
+ALLOWED_REACTIONS = {
+    "❤️", "👌", "👍", "😁", "🔥", "🤡", "🤣", "👎", "🥰", "👏", "🤔", "🤯", "😱", "🤬", "😢",
+    "🎉", "🤩", "🤮", "💩", "🙏", "🕊️", "🥱", "🥴", "😍", "🐳", "❤️‍🔥", "🌚", "🌭", "💯", "⚡",
+    "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻",
+    "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍️", "🤗", "🫡", "🎅", "🎄", "☃️", "💅", "🤪", "🗿",
+    "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂️", "🤷", "🤷‍♀️", "😡"
+}
+
 def get_system_prompt(chat_type, user_name=""):
     if chat_type == "private":
         base_prompt = config.AI_PROMPT_PM or ""
@@ -28,13 +37,13 @@ def get_system_prompt(chat_type, user_name=""):
     else:
         base_prompt = f"{config.AI_PROMPT_GM}\n{config.AI_PROMPT_TGM}"
 
+    allowed_str = ", ".join(ALLOWED_REACTIONS)
     reaction_rule = (
-        "\n\n[СЕКРЕТНАЯ ИНСТРУКЦИЯ (СТРОГО): Если уместно отреагировать эмоцией, начни ответ с тега [REACTION: эмодзи]. "
-        "Разрешен ТОЛЬКО этот точный список эмодзи: "
-        "❤️, 👌, 👍, 😁, 🔥, 🤡, 🤣, 👎, 🥰, 👏, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 🕊️, 🥱, 🥴, 😍, 🐳, ❤️‍🔥, 🌚, 🌭, 💯, ⚡, 🍌, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 🖕, 😈, 😴, 😭, 🤓, 👻, 👨‍💻, 👀, 🎃, 🙈, 😇, 😨, 🤝, ✍️, 🤗, 🫡, 🎅, 🎄, ☃️, 💅, 🤪, 🗿, 🆒, 💘, 🙉, 🦄, 😘, 💊, 🙊, 😎, 👾, 🤷‍♂️, 🤷, 🤷‍♀️, 😡. "
-        "\n❗️ ПРАВИЛО ВЫЖИВАНИЯ: Если идеального эмодзи нет в этом списке — НЕ ПИШИ ТЕГ ВООБЩЕ. "
-        "Использование эмодзи вне списка ВЫЗЫВАЕТ КРИТИЧЕСКУЮ ОШИБКУ API ТЕЛЕГРАМА И ПОЛОМКУ БОТА. "
-        "Если текст ответа не нужен, отвечай ТОЛЬКО одним тегом из списка.]"
+        "\n\n[ПРАВИЛО РЕАКЦИЙ TELEGRAM: Если хочешь поставить реакцию на сообщение пользователя, "
+        "начни свой ответ со специального тега [REACTION: эмодзи]. "
+        f"Внутри тега [REACTION: ...] разрешено использовать ТОЛЬКО эмодзи из этого списка: {allowed_str}. "
+        "В самом тексте ответа можно использовать любые смайлики, но в теге [REACTION: ...] — строго из списка! "
+        "Если подходящей реакции в списке нет — просто пиши текст без тега [REACTION].]"
     )
     return base_prompt + reaction_rule
 
@@ -169,12 +178,17 @@ def get_capable_models(required_capability: str, current_model_id: str):
     return ordered
 
 
-async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str = "", image_bytes: bytes = None):
-    # Помечаем в истории базы данных, что к тексту была прикреплена картинка
-    db_prompt = f"[Фото] {prompt}" if image_bytes else prompt
-    await database.add_message_to_db(user_or_chat_id, "user", db_prompt)
+async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str = "", image_bytes: bytes = None, save_to_history: bool = True):
+    # Сохраняем запрос в БД только если это реальное сообщение пользователя, а не системная команда
+    if save_to_history:
+        db_prompt = f"[Фото] {prompt}" if image_bytes else prompt
+        await database.add_message_to_db(user_or_chat_id, "user", db_prompt)
 
     history = await database.get_history_from_db(user_or_chat_id, limit=12)
+    # Если мы не сохраняли системный промпт в БД, добавляем его временно в конец истории для генерации
+    if not save_to_history:
+        history.append({"role": "user", "content": prompt})
+
     sys_prompt = get_system_prompt(chat_type, user_name)
 
     current_model_id = await database.get_user_model(user_or_chat_id)
