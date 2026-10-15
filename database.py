@@ -67,6 +67,24 @@ async def init_db():
                              TEXT
                          )
                          """)
+        # На случай если таблица settings уже существовала без колонки праздников:
+        try:
+            await db.execute("ALTER TABLE settings ADD COLUMN holidays_enabled INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+        # Таблица для Дней Рождения и особых дат конкретного чата
+        await db.execute("""
+                    CREATE TABLE IF NOT EXISTS custom_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_key TEXT,
+                        day INTEGER,
+                        month INTEGER,
+                        title TEXT,
+                        category TEXT DEFAULT 'holiday'
+                    )
+                """)
+        await db.commit()
         await db.commit()
 
 
@@ -134,6 +152,9 @@ async def get_show_tech_details(chat_key):  return await _get_setting(chat_key, 
 
 async def toggle_show_tech_details(chat_key): return await _toggle_setting(chat_key, "show_tech_details")
 
+async def get_holidays_enabled(chat_key):   return await _get_setting(chat_key, "holidays_enabled", 0)
+
+async def toggle_holidays_enabled(chat_key): return await _toggle_setting(chat_key, "holidays_enabled")
 
 # ==========================================
 # ИСТОРИЯ ДИАЛОГОВ И МОДЕЛИ
@@ -213,3 +234,47 @@ def get_ordered_models(current_model_id: str):
         if m["id"] != current_model_id:
             ordered.append(m)
     return ordered
+
+# ==========================================
+# УПРАВЛЕНИЕ ДНЯМИ РОЖДЕНИЯ И ДАТАМИ
+# ==========================================
+
+async def add_custom_event(chat_key, day: int, month: int, title: str, category: str = "holiday"):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO custom_events (chat_key, day, month, title, category) VALUES (?, ?, ?, ?, ?)",
+            (str(chat_key), day, month, title.strip(), category)
+        )
+        await db.commit()
+
+async def get_custom_events(chat_key):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, day, month, title, category FROM custom_events WHERE chat_key = ? ORDER BY month, day",
+            (str(chat_key),)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+async def get_custom_events_by_date(chat_key, day: int, month: int):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, day, month, title, category FROM custom_events WHERE chat_key = ? AND day = ? AND month = ?",
+            (str(chat_key), day, month)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+async def delete_custom_event(event_id: int, chat_key):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute("DELETE FROM custom_events WHERE id = ? AND chat_key = ?", (event_id, str(chat_key)))
+        await db.commit()
+
+async def get_all_holiday_enabled_chats():
+    """Возвращает список ID всех чатов, где включены уведомления о праздниках"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute("SELECT chat_key FROM settings WHERE holidays_enabled = 1") as cursor:
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]

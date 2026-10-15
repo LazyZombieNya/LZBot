@@ -2,6 +2,7 @@ import asyncio
 import re
 import html
 import logging
+import holidays
 import io
 from datetime import datetime, timezone, timedelta
 import pymupdf
@@ -196,19 +197,22 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     respond_all = await database.get_respond_all(chat_key)
     silent_responses = await database.get_silent_responses(chat_key)
     show_tech_details = await database.get_show_tech_details(chat_key)
+    holidays_enabled = await database.get_holidays_enabled(chat_key)
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
     btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
+    btn6 = "🟢 Праздники и ДР: ВКЛ" if holidays_enabled else "🔴 Праздники и ДР: ВЫКЛ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
         [InlineKeyboardButton(btn2, callback_data="setting:keep_context")],
         [InlineKeyboardButton(btn3, callback_data="setting:respond_all")],
         [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")],
-        [InlineKeyboardButton(btn5, callback_data="setting:show_tech_details")]
+        [InlineKeyboardButton(btn5, callback_data="setting:show_tech_details")],
+        [InlineKeyboardButton(btn6, callback_data="setting:holidays")]
     ])
 
     await update.message.reply_text("⚙️ <b>Настройки чата:</b>", reply_markup=markup, parse_mode='HTML')
@@ -237,25 +241,31 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await database.toggle_silent_responses(chat_key)
     elif setting_type == "show_tech_details":
         await database.toggle_show_tech_details(chat_key)
+    elif setting_type == "holidays":
+        await database.toggle_holidays_enabled(chat_key)
 
     auto_fallback = await database.get_auto_fallback(chat_key)
     keep_context = await database.get_keep_context(chat_key)
     respond_all = await database.get_respond_all(chat_key)
     silent_responses = await database.get_silent_responses(chat_key)
     show_tech_details = await database.get_show_tech_details(chat_key)
+    holidays_enabled = await database.get_holidays_enabled(chat_key)
+
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
     btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
+    btn6 = "🟢 Праздники и ДР: ВКЛ" if holidays_enabled else "🔴 Праздники и ДР: ВЫКЛ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
         [InlineKeyboardButton(btn2, callback_data="setting:keep_context")],
         [InlineKeyboardButton(btn3, callback_data="setting:respond_all")],
         [InlineKeyboardButton(btn4, callback_data="setting:silent_responses")],
-        [InlineKeyboardButton(btn5, callback_data="setting:show_tech_details")]
+        [InlineKeyboardButton(btn5, callback_data="setting:show_tech_details")],
+        [InlineKeyboardButton(btn6, callback_data="setting:holidays")]
     ])
 
     await query.edit_message_reply_markup(reply_markup=markup)
@@ -340,6 +350,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prepared_reply = None
     is_mentioned = bool(context.bot.username and re.search(
         rf"(?<!\w)@{re.escape(context.bot.username)}(?!\w)", user_text_only, re.IGNORECASE))
+
+    # === БЫСТРЫЙ ТРИГГЕР ПО СЛОВУ "ПРАЗДНИКИ" ===
+    clean_word = re.sub(r'[^\wа-яА-ЯёЁ]', '', user_text_only).strip().lower()
+    if clean_word in ("праздники", "праздник"):
+        is_silent = await database.get_silent_responses(history_key)
+        wait_msg = await trigger_msg.reply_text("🎉 Смотрю календарь праздников...", disable_notification=True)
+        try:
+            holiday_reply = await holidays.build_today_holidays_message(history_key)
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+
+            for part in split_message(holiday_reply):
+                if part.strip():
+                    await trigger_msg.reply_text(part, parse_mode='HTML', disable_notification=is_silent)
+        except Exception as e:
+            logger.error(f"Ошибка вывода праздников: {e}")
+            try:
+                await wait_msg.edit_text("⚠️ Не удалось загрузить календарь праздников.")
+            except Exception:
+                await trigger_msg.reply_text("⚠️ Не удалось загрузить календарь праздников.")
+        return
+
     if chat_type != "private" and not (is_mentioned or is_reply_to_bot):
         silence_until = config.silenced_chats.get(chat_id)
         if silence_until and datetime.now(timezone.utc) < silence_until:
@@ -855,3 +889,92 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if reply:
             await update.message.reply_text(reply, parse_mode='HTML', disable_notification=is_silent)
+
+# ==========================================
+# УПРАВЛЕНИЕ ПРАЗДНИКАМИ И ДР (/events)
+# ==========================================
+
+async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список ДР/событий чата и позволяет добавлять или удалять их"""
+    chat_key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
+
+    # Если переданы аргументы: /events 15.10 др День рождения Дениса
+    if context.args and len(context.args) >= 2:
+        if not await check_admin_rights(update, context):
+            await update.message.reply_text("❌ Добавлять даты в группе могут только администраторы.")
+            return
+
+        date_arg = context.args[0]
+        match = re.match(r'^(\d{1,2})[./-](\d{1,2})$', date_arg)
+        if not match:
+            await update.message.reply_text("⚠️ Неверный формат даты. Используйте: <code>/events ДД.ММ Название</code>", parse_mode='HTML')
+            return
+
+        day, month = int(match.group(1)), int(match.group(2))
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            await update.message.reply_text("⚠️ Проверьте правильность дня и месяца.")
+            return
+
+        # Проверяем, указан ли тип "др"
+        second_word = context.args[1].lower()
+        if second_word in ("др", "bd", "birthday") and len(context.args) >= 3:
+            category = "birthday"
+            title = " ".join(context.args[2:])
+        else:
+            category = "holiday"
+            title = " ".join(context.args[1:])
+
+        await database.add_custom_event(chat_key, day, month, title, category)
+        icon = "🎂" if category == "birthday" else "⭐"
+        await update.message.reply_text(f"✅ Добавлено: {icon} <b>{day:02d}.{month:02d}</b> — {html.escape(title)}", parse_mode='HTML')
+        return
+
+    # Если вызвано просто /events — выводим список и кнопки удаления
+    events = await database.get_custom_events(chat_key)
+    text = (
+        "📅 <b>Особые даты и Дни рождения этого чата:</b>\n\n"
+        "Чтобы добавить дату, напишите:\n"
+        "• <code>/events 15.10 др Имя</code> — добавить День рождения 🎂\n"
+        "• <code>/events 25.12 Новогодний корпоратив</code> — особый день ⭐\n\n"
+    )
+
+    kb = []
+    if not events:
+        text += "<i>Список пока пуст.</i>"
+    else:
+        for ev in events:
+            icon = "🎂" if ev["category"] == "birthday" else "⭐"
+            line = f"{icon} <b>{ev['day']:02d}.{ev['month']:02d}</b> — {html.escape(ev['title'])}"
+            text += line + "\n"
+            kb.append([InlineKeyboardButton(
+                f"🗑 Удалить: {ev['day']:02d}.{ev['month']:02d} {ev['title'][:20]}",
+                callback_data=f"del_event:{ev['id']}"
+            )])
+
+    await update.message.reply_text(
+        text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(kb) if kb else None
+    )
+
+async def delete_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await check_admin_rights(update, context):
+        await query.answer("❌ Удалять даты могут только админы!", show_alert=True)
+        return
+
+    await query.answer("Удалено!")
+    chat_key = query.from_user.id if query.message.chat.type == 'private' else query.message.chat.id
+    event_id = int(query.data.split(":")[1])
+
+    await database.delete_custom_event(event_id, chat_key)
+    events = await database.get_custom_events(chat_key)
+
+    kb = []
+    for ev in events:
+        kb.append([InlineKeyboardButton(
+            f"🗑 Удалить: {ev['day']:02d}.{ev['month']:02d} {ev['title'][:20]}",
+            callback_data=f"del_event:{ev['id']}"
+        )])
+
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb) if kb else None)

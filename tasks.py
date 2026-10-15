@@ -4,11 +4,14 @@ import os
 import re
 import logging
 from telegram.ext import ContextTypes
+from datetime import datetime
 
 import config
-from ai_core import groq_client
 from access import get_and_mark_expiring_subscriptions
 import web_parser
+import database
+import holidays
+import ai_core
 
 logger = logging.getLogger(__name__)
 
@@ -333,3 +336,43 @@ async def check_expirations_job(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
+    """Каждое утро проверяет: есть ли сегодня в чатах чьи-то ДР или особые даты, и поздравляет!"""
+    now = datetime.now()
+    enabled_chats = await database.get_all_holiday_enabled_chats()
+
+    for chat_id_str in enabled_chats:
+        try:
+            chat_id = int(chat_id_str)
+            todays_events = await database.get_custom_events_by_date(chat_id, now.day, now.month)
+            if not todays_events:
+                continue
+
+            events_desc = "\n".join(
+                [f"- {'День рождения' if e['category']=='birthday' else 'Праздник чата'}: {e['title']}" for e in todays_events]
+            )
+            prompt = (
+                f"[Системное событие: сегодня ({now.day:02d}.{now.month:02d}) в нашем чате особенный день!]\n"
+                f"Список событий:\n{events_desc}\n\n"
+                "Напиши теплое, душевное и креативное поздравление от лица бота для участников чата! "
+                "Используй праздничные эмодзи, но не пиши тег [REACTION]."
+            )
+            reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
+            if reply:
+                await context.bot.send_message(chat_id=chat_id, text=reply, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Ошибка поздравления в чате {chat_id_str}: {e}")
+
+
+async def monday_weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    """Каждый понедельник утром отправляет расписание праздников и ДР на неделю"""
+    enabled_chats = await database.get_all_holiday_enabled_chats()
+    for chat_id_str in enabled_chats:
+        try:
+            chat_id = int(chat_id_str)
+            digest = await holidays.build_monday_digest(chat_id)
+            if digest:
+                await context.bot.send_message(chat_id=chat_id, text=digest, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Ошибка еженедельного дайджеста в чате {chat_id_str}: {e}")

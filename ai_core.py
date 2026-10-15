@@ -77,7 +77,7 @@ async def query_gemini(model_id: str, history: list, sys_prompt: str, image_byte
         asyncio.to_thread(gemini_client.models.generate_content, model=model_id, contents=contents, config=conf),
         timeout=15.0
     )
-    return response.text.strip()
+    return (response.text or "").strip()
 
 
 async def query_groq(model_id: str, history: list, sys_prompt: str, image_bytes: bytes = None) -> str:
@@ -232,6 +232,12 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
                     continue
 
                 reply_text = sanitize_text(reply_text)
+
+                # Если после очистки от <think> модель вернула пустоту (или только тег реакции без текста, когда нужен ответ),
+                # считаем это сбоем модели и пробуем следующую в каскаде!
+                text_without_reaction = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply_text).strip()
+                if not reply_text or (not save_to_history and not text_without_reaction):
+                    raise ValueError("Модель вернула пустой текст ответа")
 
                 # Записываем смену модели только если это обычный текстовый запрос
                 # (Чтобы бот не переключился на vision-модель навсегда, если юзер просто скинул одну фотку)

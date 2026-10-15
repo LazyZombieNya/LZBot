@@ -35,6 +35,7 @@ async def on_startup(application):
         BotCommand("reset", "Сбросить историю диалога"),
         BotCommand("help", "Показать список команд"),
         BotCommand("model", "Выбрать модель"),
+        BotCommand("events", "Дни рождения и особые даты")
     ]
     await application.bot.set_my_commands(commands)
 
@@ -58,6 +59,10 @@ def main():
     app.job_queue.run_repeating(tasks.check_expirations_job, interval=3600, first=10)
     app.job_queue.run_daily(tasks.check_youtube_cookies_job, time=time(hour=9, minute=0))
     app.job_queue.run_daily(tasks.sync_api_models_job, time=time(hour=7, minute=00))
+    # Ежедневная проверка ДР и особых дат в 09:00
+    app.job_queue.run_daily(tasks.daily_custom_holidays_job, time=time(hour=9, minute=0))
+    # Еженедельный дайджест по понедельникам (days=(0,)) в 09:05
+    app.job_queue.run_daily(tasks.monday_weekly_digest_job, time=time(hour=9, minute=5), days=(0,))
 
     app.add_handler(CommandHandler("start", handlers.start_command))
     app.add_handler(CommandHandler("reset", handlers.reset_history))
@@ -66,6 +71,7 @@ def main():
     app.add_handler(CommandHandler("setting", handlers.settings_command))
     app.add_handler(CommandHandler("zombie_allowed", handlers.zombie_allowed_command))
     app.add_handler(CommandHandler("pay", handlers.pay_command))
+    app.add_handler(CommandHandler("events", handlers.events_command))
 
     app.add_handler(CallbackQueryHandler(handlers.pay_callback, pattern="^paid:"))
     app.add_handler(CallbackQueryHandler(handlers.admin_confirm_callback, pattern="^admin_(confirm|reject):"))
@@ -74,6 +80,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handlers.silence_callback, pattern="^(silence|unsilence):"))
     app.add_handler(CallbackQueryHandler(handlers.expand_callback, pattern="^more:"))
     app.add_handler(CallbackQueryHandler(handlers.cancel_callback, pattern="^cancel:", block=False))
+    app.add_handler(CallbackQueryHandler(handlers.delete_event_callback, pattern="^del_event:"))
 
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & ~filters.COMMAND,
