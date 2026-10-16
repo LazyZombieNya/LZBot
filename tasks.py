@@ -339,14 +339,16 @@ async def check_expirations_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждое утро проверяет: есть ли сегодня в чатах чьи-то ДР или особые даты, и поздравляет!"""
-    now = datetime.now()
+    now = datetime.now(config.BOT_TIMEZONE)
     enabled_chats = await database.get_all_holiday_enabled_chats()
+    logger.info(f"Проверка праздников на {now.day:02d}.{now.month:02d}. Чатов с включенной настройкой: {len(enabled_chats)}")
 
     for chat_id_str in enabled_chats:
         try:
             chat_id = int(chat_id_str)
             todays_events = await database.get_custom_events_by_date(chat_id, now.day, now.month)
             if not todays_events:
+                logger.info(f"Чат {chat_id}: на {now.day:02d}.{now.month:02d} кастомных событий нет.")
                 continue
 
             events_desc = "\n".join(
@@ -359,8 +361,10 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
                 "Используй праздничные эмодзи, но не пиши тег [REACTION]."
             )
             reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
+            reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply or "").strip()
             if reply:
                 await context.bot.send_message(chat_id=chat_id, text=reply, parse_mode='HTML')
+                logger.info(f"Отправлено праздничное поздравление в чат {chat_id} ✅")
         except Exception as e:
             logger.error(f"Ошибка поздравления в чате {chat_id_str}: {e}")
 

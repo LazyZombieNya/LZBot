@@ -4,6 +4,10 @@ import logging
 from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
+from datetime import timezone, timedelta
+
+# Часовой пояс бота (Челябинск / Екатеринбург = UTC+5)
+BOT_TIMEZONE = timezone(timedelta(hours=5))
 
 # Инициализируем логгер для вывода критических ошибок конфигурации
 logger = logging.getLogger(__name__)

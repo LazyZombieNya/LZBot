@@ -57,12 +57,13 @@ def main():
     # Запускаем проверку каждые 3600 секунд (1 час).
     # first=10 означает, что первая проверка пройдет через 10 секунд после старта бота
     app.job_queue.run_repeating(tasks.check_expirations_job, interval=3600, first=10)
-    app.job_queue.run_daily(tasks.check_youtube_cookies_job, time=time(hour=9, minute=0))
-    app.job_queue.run_daily(tasks.sync_api_models_job, time=time(hour=7, minute=00))
-    # Ежедневная проверка ДР и особых дат в 09:00
-    app.job_queue.run_daily(tasks.daily_custom_holidays_job, time=time(hour=9, minute=0))
-    # Еженедельный дайджест по понедельникам (days=(0,)) в 09:05
-    app.job_queue.run_daily(tasks.monday_weekly_digest_job, time=time(hour=9, minute=5), days=(0,))
+    app.job_queue.run_daily(tasks.check_youtube_cookies_job, time=time(hour=9, minute=0, tzinfo=config.BOT_TIMEZONE))
+    app.job_queue.run_daily(tasks.sync_api_models_job, time=time(hour=7, minute=0, tzinfo=config.BOT_TIMEZONE))
+    # Ежедневная проверка ДР и особых дат в 09:00 по местному времени
+    app.job_queue.run_daily(tasks.daily_custom_holidays_job, time=time(hour=9, minute=0, tzinfo=config.BOT_TIMEZONE))
+    # Еженедельный дайджест по понедельникам в 09:05 по местному времени
+    app.job_queue.run_daily(tasks.monday_weekly_digest_job, time=time(hour=9, minute=5, tzinfo=config.BOT_TIMEZONE),
+                            days=(0,))
 
     app.add_handler(CommandHandler("start", handlers.start_command))
     app.add_handler(CommandHandler("reset", handlers.reset_history))
