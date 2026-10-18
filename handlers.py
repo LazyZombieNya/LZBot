@@ -204,7 +204,13 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
     btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
-    btn6 = "🟢 Праздники и ДР: ВКЛ" if holidays_enabled else "🔴 Праздники и ДР: ВЫКЛ"
+    holidays_mode = await database.get_holidays_mode(chat_key)
+    if holidays_mode == 1:
+        btn6 = "🟡 Праздники: ТОЛЬКО СВОИ (ДР)"
+    elif holidays_mode == 2:
+        btn6 = "🟢 Праздники: ВСЕ (КАЖДЫЙ ДЕНЬ)"
+    else:
+        btn6 = "🔴 Праздники и ДР: ВЫКЛ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
@@ -257,7 +263,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
     btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
-    btn6 = "🟢 Праздники и ДР: ВКЛ" if holidays_enabled else "🔴 Праздники и ДР: ВЫКЛ"
+    holidays_mode = await database.get_holidays_mode(chat_key)
+    if holidays_mode == 1:
+        btn6 = "🟡 Праздники: ТОЛЬКО СВОИ (ДР)"
+    elif holidays_mode == 2:
+        btn6 = "🟢 Праздники: ВСЕ (КАЖДЫЙ ДЕНЬ)"
+    else:
+        btn6 = "🔴 Праздники и ДР: ВЫКЛ"
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(btn1, callback_data="setting:auto_fallback")],
@@ -898,7 +910,29 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список ДР/событий чата и позволяет добавлять или удалять их"""
     chat_key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
 
-    # Если переданы аргументы: /events 15.10 др День рождения Дениса
+    # --- БЫСТРЫЙ ТЕСТ РАССЫЛОК ДЛЯ АДМИНА ---
+    if context.args and len(context.args) == 1 and context.args[0].lower() in ("test_mon", "test_fri", "test_day"):
+        if not await check_admin_rights(update, context):
+            return
+        cmd = context.args[0].lower()
+        now = datetime.now(config.BOT_TIMEZONE)
+        wait_msg = await update.message.reply_text(f"🧪 Тестирую задачу <code>{cmd}</code>...", parse_mode='HTML')
+        try:
+            if cmd == "test_mon":
+                res = await holidays.build_monday_digest(chat_key, start_dt=now)
+            elif cmd == "test_fri":
+                res = await holidays.build_friday_preview(chat_key, friday_dt=now)
+                if not res:
+                    res = "ℹ️ На следующей неделе (Пн–Вс от текущей даты) в этом чате нет своих ДР или особых дат, поэтому пятничное сообщение не отправляется."
+            else:
+                res = await holidays.build_today_holidays_message(chat_key, dt=now)
+            await wait_msg.delete()
+            await update.message.reply_text(res, parse_mode='HTML')
+        except Exception as e:
+            await wait_msg.edit_text(f"⚠️ Ошибка теста: {e}")
+        return
+
+    # Если переданы аргументы: /events 15.10 др День рождения Ползователя
     if context.args and len(context.args) >= 2:
         if not await check_admin_rights(update, context):
             await update.message.reply_text("❌ Добавлять даты в группе могут только администраторы.")
@@ -930,9 +964,17 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Если вызвано просто /events — выводим список и кнопки удаления
+    holidays_mode = await database.get_holidays_mode(chat_key)
+    mode_status = {
+        0: "🔴 <b>Уведомления о праздниках сейчас ВЫКЛЮЧЕНЫ!</b> (Включите их в /setting)",
+        1: "🟡 Режим уведомлений: <b>Только свои даты и ДР</b>",
+        2: "🟢 Режим уведомлений: <b>Все праздники ежедневно</b>"
+    }.get(holidays_mode, "")
+
     events = await database.get_custom_events(chat_key)
     text = (
-        "📅 <b>Особые даты и Дни рождения этого чата:</b>\n\n"
+        "📅 <b>Особые даты и Дни рождения этого чата:</b>\n"
+        f"{mode_status}\n\n"
         "Чтобы добавить дату, напишите:\n"
         "• <code>/events 15.10 др Имя</code> — добавить День рождения 🎂\n"
         "• <code>/events 25.12 Новогодний корпоратив</code> — особый день ⭐\n\n"

@@ -61,9 +61,10 @@ def main():
     app.job_queue.run_daily(tasks.sync_api_models_job, time=time(hour=7, minute=0, tzinfo=config.BOT_TIMEZONE))
     # Ежедневная проверка ДР и особых дат в 09:00 по местному времени
     app.job_queue.run_daily(tasks.daily_custom_holidays_job, time=time(hour=9, minute=0, tzinfo=config.BOT_TIMEZONE))
-    # Еженедельный дайджест по понедельникам в 09:05 по местному времени
-    app.job_queue.run_daily(tasks.monday_weekly_digest_job, time=time(hour=9, minute=5, tzinfo=config.BOT_TIMEZONE),
-                            days=(0,))
+    # Еженедельный дайджест по понедельникам (в PTB: 0=Вс, 1=Пн, ..., 5=Пт) в 09:05
+    app.job_queue.run_daily(tasks.monday_weekly_digest_job, time=time(hour=9, minute=5, tzinfo=config.BOT_TIMEZONE),days=(1,))
+    # Пятничный анонс событий следующей недели в 16:00 по пятницам (5=Пт)
+    app.job_queue.run_daily(tasks.friday_upcoming_events_job, time=time(hour=16, minute=0, tzinfo=config.BOT_TIMEZONE),days=(5,))
 
     app.add_handler(CommandHandler("start", handlers.start_command))
     app.add_handler(CommandHandler("reset", handlers.reset_history))

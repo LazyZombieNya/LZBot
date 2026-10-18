@@ -141,8 +141,16 @@ async def build_today_holidays_message(chat_id: int, dt: datetime = None) -> str
     return fallback_text
 
 
+def _format_holidays_Mode_label(mode: int) -> str:
+    if mode == 1:
+        return "🟡 Праздники: ТОЛЬКО СВОИ (ДР)"
+    elif mode == 2:
+        return "🟢 Праздники: ВСЕ (КАЖДЫЙ ДЕНЬ)"
+    return "🔴 Праздники и ДР: ВЫКЛ"
+
+
 async def build_monday_digest(chat_id: int, start_dt: datetime = None) -> str:
-    """Формирует еженедельный дайджест по понедельникам"""
+    """Краткий дайджест на понедельник: только главные праздники (по 1 на день) + все свои события"""
     if start_dt is None:
         start_dt = datetime.now()
 
@@ -158,20 +166,23 @@ async def build_monday_digest(chat_id: int, start_dt: datetime = None) -> str:
             f"{'🎂 ДР: ' if e['category']=='birthday' else '⭐ '}{e['title']}"
             for e in all_custom if e["day"] == cur.day and e["month"] == cur.month
         ]
-        day_web = await fetch_web_holidays(cur, max_items=2)
+        # Берем только 1 главный общий праздник, чтобы сообщение было коротким
+        day_web = await fetch_web_holidays(cur, max_items=1)
 
         combined = day_custom + day_web
         if combined:
             week_lines.append(f"• <b>{day_label}</b>: " + "; ".join(combined))
 
     facts = "\n".join(week_lines)
-    fallback_digest = f"🗓 <b>Праздники и события на эту неделю:</b>\n\n{facts}"
+    fallback_digest = f"🗓 <b>Коротко о главном на этой неделе:</b>\n\n{facts}"
 
     prompt = (
-        "Сегодня понедельник! Напиши для чата бодрый дайджест праздников и событий на текущую неделю.\n"
-        f"Вот расписание по дням:\n{facts}\n\n"
-        "Оформи компактно по дням недели. Если есть Дни рождения (🎂) или особые даты чата (⭐) — "
-        "выдели их особенно заметно! Отвечай ТОЛЬКО текстом, НЕ используй тег [REACTION]."
+        "Сегодня понедельник! Напиши для чата ОЧЕНЬ КРАТКИЙ и бодрый обзор главных праздников и событий на эту неделю.\n"
+        f"Данные по дням:\n{facts}\n\n"
+        "Правила:\n"
+        "1. Пиши максимально лаконично (по 1 короткой строчке на день).\n"
+        "2. Если есть Дни рождения (🎂) или особые даты чата (⭐) — выдели их в самом начале!\n"
+        "3. Отвечай ТОЛЬКО текстом, НЕ используй тег [REACTION]."
     )
 
     try:
@@ -185,37 +196,52 @@ async def build_monday_digest(chat_id: int, start_dt: datetime = None) -> str:
     return fallback_digest
 
 
-async def build_monday_digest(chat_id: int, start_dt: datetime = None) -> str:
-    """Формирует еженедельный дайджест по понедельникам"""
-    if start_dt is None:
-        start_dt = datetime.now()
+async def build_friday_preview(chat_id: int, friday_dt: datetime = None) -> str | None:
+    """Пятничный анонс: проверяет следующую неделю (Пн-Вс). Если своих ДР/событий нет — возвращает None."""
+    if friday_dt is None:
+        friday_dt = datetime.now()
 
     all_custom = await database.get_custom_events(chat_id)
-    week_lines = []
+    if not all_custom:
+        return None
 
+    # Следующий понедельник = пятница + 3 дня
+    next_monday = friday_dt + timedelta(days=3)
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    upcoming_custom = []
 
     for i in range(7):
-        cur = start_dt + timedelta(days=i)
+        cur = next_monday + timedelta(days=i)
         day_label = f"{days_ru[cur.weekday()]} ({cur.day:02d}.{cur.month:02d})"
+        for e in all_custom:
+            if e["day"] == cur.day and e["month"] == cur.month:
+                icon = "🎂 День рождения:" if e["category"] == "birthday" else "⭐ Особое событие:"
+                upcoming_custom.append(f"• <b>{day_label}</b> — {icon} {e['title']}")
 
-        # Ищем кастомные события на этот день
-        day_custom = [
-            f"{'🎂 ДР: ' if e['category'] == 'birthday' else '⭐ '}{e['title']}"
-            for e in all_custom if e["day"] == cur.day and e["month"] == cur.month
-        ]
-        # Берем топ-2 общих праздника на этот день
-        day_web = await fetch_web_holidays(cur, max_items=2)
+    # Если на следующей неделе нет внутренних событий или ДР — ничего не пишем
+    if not upcoming_custom:
+        return None
 
-        combined = day_custom + day_web
-        if combined:
-            week_lines.append(f"• <b>{day_label}</b>: " + "; ".join(combined))
-
-    facts = "\n".join(week_lines)
-    prompt = (
-        "[Системная задача: сегодня понедельник! Напиши для чата бодрый дайджест праздников и событий на текущую неделю].\n"
-        f"Вот расписание праздников и дней рождения по дням:\n{facts}\n\n"
-        "Оформи это красиво и компактно по дням недели. Если на неделе есть Дни рождения (🎂) или особые даты чата (⭐) — "
-        "обязательно сделай на них акцент в начале или в конце сообщения! Не используй тег [REACTION]."
+    events_block = "\n".join(upcoming_custom)
+    fallback_text = (
+        "🍻 <b>Рабочая неделя подходит к концу!</b>\n\n"
+        "🔔 Напоминаю, какие важные даты ждут нас на следующей неделе:\n"
+        f"{events_block}"
     )
-    return await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
+
+    prompt = (
+        "Сегодня пятница, рабочая неделя подходит к концу! "
+        "Поздравь чат с пятницей в 1 предложении и напомни ребятам, какие Дни рождения и особые события нашего чата "
+        f"ждут нас на следующей неделе:\n{events_block}\n\n"
+        "Пиши коротко, тепло и с эмодзи. НЕ используй тег [REACTION]."
+    )
+
+    try:
+        reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
+        clean_reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply or "").strip()
+        if clean_reply and not clean_reply.startswith("⚠️"):
+            return clean_reply
+    except Exception as e:
+        logger.warning(f"Ошибка ИИ в пятничном анонсе: {e}")
+
+    return fallback_text

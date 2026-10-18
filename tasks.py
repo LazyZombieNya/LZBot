@@ -1,10 +1,12 @@
+import html
+
 import aiohttp
 import json
 import os
 import re
 import logging
 from telegram.ext import ContextTypes
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import config
 from access import get_and_mark_expiring_subscriptions
@@ -338,44 +340,99 @@ async def check_expirations_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
-    """Каждое утро проверяет: есть ли сегодня в чатах чьи-то ДР или особые даты, и поздравляет!"""
+    """Ежедневная утренняя рассылка в 09:00 с учетом режима (1 - только свои, 2 - все) + алерт админам за 3 дня до ДР"""
     now = datetime.now(config.BOT_TIMEZONE)
+    in_3_days = now + timedelta(days=3)
     enabled_chats = await database.get_all_holiday_enabled_chats()
-    logger.info(f"Проверка праздников на {now.day:02d}.{now.month:02d}. Чатов с включенной настройкой: {len(enabled_chats)}")
 
-    for chat_id_str in enabled_chats:
+    for chat_id_str, mode in enabled_chats:
         try:
             chat_id = int(chat_id_str)
             todays_events = await database.get_custom_events_by_date(chat_id, now.day, now.month)
-            if not todays_events:
-                logger.info(f"Чат {chat_id}: на {now.day:02d}.{now.month:02d} кастомных событий нет.")
-                continue
 
-            events_desc = "\n".join(
-                [f"- {'День рождения' if e['category']=='birthday' else 'Праздник чата'}: {e['title']}" for e in todays_events]
-            )
-            prompt = (
-                f"[Системное событие: сегодня ({now.day:02d}.{now.month:02d}) в нашем чате особенный день!]\n"
-                f"Список событий:\n{events_desc}\n\n"
-                "Напиши теплое, душевное и креативное поздравление от лица бота для участников чата! "
-                "Используй праздничные эмодзи, но не пиши тег [REACTION]."
-            )
-            reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
-            reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply or "").strip()
-            if reply:
-                await context.bot.send_message(chat_id=chat_id, text=reply, parse_mode='HTML')
-                logger.info(f"Отправлено праздничное поздравление в чат {chat_id} ✅")
+            # 1. Отправка поздравления в сам чат
+            if mode == 2:
+                # Режим "ВСЕ ПРАЗДНИКИ": отправляем полную сводку на сегодня (свои + общие РФ)
+                msg = await holidays.build_today_holidays_message(chat_id, dt=now)
+                if msg:
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+            elif mode == 1 and todays_events:
+                # Режим "ТОЛЬКО СВОИ": пишем только если сегодня есть кастомный праздник или ДР
+                events_desc = "\n".join(
+                    [f"- {'День рождения' if e['category']=='birthday' else 'Праздник чата'}: {e['title']}" for e in todays_events]
+                )
+                prompt = (
+                    f"[Системное событие: сегодня ({now.day:02d}.{now.month:02d}) в нашем чате особенный день!]\n"
+                    f"Список событий:\n{events_desc}\n\n"
+                    "Напиши теплое, душевное и креативное поздравление от лица бота для участников чата! "
+                    "Используй праздничные эмодзи, но не пиши тег [REACTION]."
+                )
+                reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
+                reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply or "").strip()
+                if reply:
+                    await context.bot.send_message(chat_id=chat_id, text=reply, parse_mode='HTML')
+
+            # 2. Проверка для ГРУПП: есть ли через 3 дня чей-то День рождения, чтобы предупредить админов в ЛС
+            if chat_id < 0:
+                upcoming_bdays = [
+                    e for e in await database.get_custom_events_by_date(chat_id, in_3_days.day, in_3_days.month)
+                    if e["category"] == "birthday"
+                ]
+                if upcoming_bdays:
+                    await _notify_group_admins_about_bday(context, chat_id, upcoming_bdays, in_3_days)
+
         except Exception as e:
-            logger.error(f"Ошибка поздравления в чате {chat_id_str}: {e}")
+            logger.error(f"Ошибка утренней рассылки праздников в чате {chat_id_str}: {e}")
+
+
+async def _notify_group_admins_about_bday(context: ContextTypes.DEFAULT_TYPE, chat_id: int, bdays: list, target_dt: datetime):
+    """Пытается отправить напоминание в ЛС админам группы за 3 дня до ДР"""
+    try:
+        chat_obj = await context.bot.get_chat(chat_id)
+        chat_title = html.escape(chat_obj.title or "группе")
+        admins = await context.bot.get_chat_administrators(chat_id)
+        admin_ids = [a.user.id for a in admins if not a.user.is_bot]
+    except Exception:
+        return
+
+    names = ", ".join(html.escape(b["title"]) for b in bdays)
+    alert_text = (
+        f"🔔 <b>Напоминание для администратора чата «{chat_title}»</b>\n\n"
+        f"Через 3 дня (<b>{target_dt.day:02d}.{target_dt.month:02d}</b>) День рождения празднует: <b>{names}</b> 🎂\n"
+        "Самое время подготовить поздравление или организовать сбор на подарок!"
+    )
+
+    for adm_id in admin_ids:
+        try:
+            await context.bot.send_message(chat_id=adm_id, text=alert_text, parse_mode='HTML')
+        except Exception:
+            # Если админ никогда не открывал ЛС с ботом — тихо пропускаем
+            pass
+
+
+async def friday_upcoming_events_job(context: ContextTypes.DEFAULT_TYPE):
+    """Каждую пятницу напоминает о ДР и особых датах следующей недели (если они есть)"""
+    now = datetime.now(config.BOT_TIMEZONE)
+    enabled_chats = await database.get_all_holiday_enabled_chats()
+    for chat_id_str, _mode in enabled_chats:
+        try:
+            chat_id = int(chat_id_str)
+            preview = await holidays.build_friday_preview(chat_id, friday_dt=now)
+            if preview:
+                await context.bot.send_message(chat_id=chat_id, text=preview, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Ошибка пятничного анонса в чате {chat_id_str}: {e}")
 
 
 async def monday_weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждый понедельник утром отправляет расписание праздников и ДР на неделю"""
+    now = datetime.now(config.BOT_TIMEZONE)
     enabled_chats = await database.get_all_holiday_enabled_chats()
-    for chat_id_str in enabled_chats:
+    logger.info(f"Запуск дайджеста понедельника. Активных чатов: {len(enabled_chats)}")
+    for chat_id_str, _mode in enabled_chats:
         try:
             chat_id = int(chat_id_str)
-            digest = await holidays.build_monday_digest(chat_id)
+            digest = await holidays.build_monday_digest(chat_id, start_dt=now)
             if digest:
                 await context.bot.send_message(chat_id=chat_id, text=digest, parse_mode='HTML')
         except Exception as e:

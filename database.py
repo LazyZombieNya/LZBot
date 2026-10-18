@@ -70,6 +70,7 @@ async def init_db():
         # На случай если таблица settings уже существовала без колонки праздников:
         try:
             await db.execute("ALTER TABLE settings ADD COLUMN holidays_enabled INTEGER DEFAULT 0")
+            await db.execute("ALTER TABLE custom_events ADD COLUMN created_by INTEGER DEFAULT 0")
         except Exception:
             pass
 
@@ -84,7 +85,6 @@ async def init_db():
                         category TEXT DEFAULT 'holiday'
                     )
                 """)
-        await db.commit()
         await db.commit()
 
 
@@ -155,6 +155,9 @@ async def toggle_show_tech_details(chat_key): return await _toggle_setting(chat_
 async def get_holidays_enabled(chat_key):   return await _get_setting(chat_key, "holidays_enabled", 0)
 
 async def toggle_holidays_enabled(chat_key): return await _toggle_setting(chat_key, "holidays_enabled")
+
+async def get_holidays_enabled(chat_key): return await get_holidays_mode(chat_key)
+async def toggle_holidays_enabled(chat_key): return await cycle_holidays_mode(chat_key)
 
 # ==========================================
 # ИСТОРИЯ ДИАЛОГОВ И МОДЕЛИ
@@ -272,9 +275,29 @@ async def delete_custom_event(event_id: int, chat_key):
         await db.execute("DELETE FROM custom_events WHERE id = ? AND chat_key = ?", (event_id, str(chat_key)))
         await db.commit()
 
-async def get_all_holiday_enabled_chats():
-    """Возвращает список ID всех чатов, где включены уведомления о праздниках"""
+async def get_all_holiday_enabled_chats() -> list[tuple[str, int]]:
+    """Возвращает список кортежей (chat_key, mode) для всех чатов, где режим > 0"""
     async with aiosqlite.connect(config.DB_PATH) as db:
-        async with db.execute("SELECT chat_key FROM settings WHERE holidays_enabled = 1") as cursor:
+        async with db.execute("SELECT chat_key, holidays_enabled FROM settings WHERE holidays_enabled > 0") as cursor:
             rows = await cursor.fetchall()
-            return [r[0] for r in rows]
+            return [(str(r[0]), int(r[1])) for r in rows]
+
+async def get_holidays_mode(chat_key) -> int:
+    """Возвращает режим праздников: 0 - выкл, 1 - только свои (ДР/события), 2 - все праздники"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute("SELECT holidays_enabled FROM settings WHERE chat_key = ?", (str(chat_key),)) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+async def cycle_holidays_mode(chat_key) -> int:
+    """Переключает режим по кругу: 0 -> 1 -> 2 -> 0"""
+    current = await get_holidays_mode(chat_key)
+    new_val = (current + 1) % 3
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO settings (chat_key, holidays_enabled)
+            VALUES (?, ?) ON CONFLICT(chat_key) DO
+            UPDATE SET holidays_enabled = excluded.holidays_enabled
+        """, (str(chat_key), new_val))
+        await db.commit()
+    return new_val
