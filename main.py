@@ -74,6 +74,7 @@ def main():
     app.add_handler(CommandHandler("zombie_allowed", handlers.zombie_allowed_command))
     app.add_handler(CommandHandler("pay", handlers.pay_command))
     app.add_handler(CommandHandler("events", handlers.events_command))
+    app.add_handler(CommandHandler("mute_bday", handlers.mute_bday_command))
 
     app.add_handler(CallbackQueryHandler(handlers.pay_callback, pattern="^paid:"))
     app.add_handler(CallbackQueryHandler(handlers.admin_confirm_callback, pattern="^admin_(confirm|reject):"))
@@ -83,6 +84,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handlers.expand_callback, pattern="^more:"))
     app.add_handler(CallbackQueryHandler(handlers.cancel_callback, pattern="^cancel:", block=False))
     app.add_handler(CallbackQueryHandler(handlers.delete_event_callback, pattern="^del_event:"))
+    app.add_handler(CallbackQueryHandler(handlers.bday_mute_callback, pattern="^bday_mute:"))
 
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & ~filters.COMMAND,

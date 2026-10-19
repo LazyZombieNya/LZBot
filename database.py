@@ -71,6 +71,14 @@ async def init_db():
         try:
             await db.execute("ALTER TABLE settings ADD COLUMN holidays_enabled INTEGER DEFAULT 0")
             await db.execute("ALTER TABLE custom_events ADD COLUMN created_by INTEGER DEFAULT 0")
+            # Таблица админов, отключивших уведомления о ДР в ЛС от конкретных групп
+            await db.execute("""
+                        CREATE TABLE IF NOT EXISTS admin_bday_mutes (
+                            chat_key TEXT,
+                            user_id INTEGER,
+                            PRIMARY KEY (chat_key, user_id)
+                        )
+                    """)
         except Exception:
             pass
 
@@ -301,3 +309,27 @@ async def cycle_holidays_mode(chat_key) -> int:
         """, (str(chat_key), new_val))
         await db.commit()
     return new_val
+
+async def is_admin_bday_muted(chat_key, user_id: int) -> bool:
+    """Проверяет, отключил ли админ уведомления о ДР из этой группы"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM admin_bday_mutes WHERE chat_key = ? AND user_id = ?",
+            (str(chat_key), int(user_id))
+        ) as cursor:
+            return (await cursor.fetchone()) is not None
+
+async def set_admin_bday_mute(chat_key, user_id: int, mute: bool = True):
+    """Включает или выключает отписку админа от ДР конкретной группы"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        if mute:
+            await db.execute(
+                "INSERT OR IGNORE INTO admin_bday_mutes (chat_key, user_id) VALUES (?, ?)",
+                (str(chat_key), int(user_id))
+            )
+        else:
+            await db.execute(
+                "DELETE FROM admin_bday_mutes WHERE chat_key = ? AND user_id = ?",
+                (str(chat_key), int(user_id))
+            )
+        await db.commit()

@@ -920,6 +920,8 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if cmd == "test_mon":
                 res = await holidays.build_monday_digest(chat_key, start_dt=now)
+                if not res:
+                    res = "ℹ️ На этой неделе нет запланированных ДР, особых событий чата или праздничных выходных среди недели, поэтому в понедельник бот промолчит."
             elif cmd == "test_fri":
                 res = await holidays.build_friday_preview(chat_key, friday_dt=now)
                 if not res:
@@ -1020,3 +1022,56 @@ async def delete_event_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )])
 
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+async def mute_bday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Позволяет админу отключить или включить личные уведомления о ДР из конкретной группы"""
+    user_id = update.effective_user.id
+
+    # Если команда вызвана прямо в группе без аргументов — берем ID этой группы
+    if not context.args and update.effective_chat.type != "private":
+        target_chat_id = str(update.effective_chat.id)
+    elif context.args:
+        target_chat_id = context.args[0].strip()
+    else:
+        await update.message.reply_text("ℹ️ Укажите ID группы: <code>/mute_bday -100123456789</code>", parse_mode='HTML')
+        return
+
+    currently_muted = await database.is_admin_bday_muted(target_chat_id, user_id)
+    new_state = not currently_muted
+    await database.set_admin_bday_mute(target_chat_id, user_id, mute=new_state)
+
+    if new_state:
+        await update.message.reply_text(
+            f"🔕 Вы отключили личные напоминания о ДР из группы <code>{html.escape(target_chat_id)}</code>.\n"
+            f"Чтобы включить обратно, введите <code>/mute_bday {html.escape(target_chat_id)}</code> ещё раз.",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            f"🔔 Личные напоминания о ДР из группы <code>{html.escape(target_chat_id)}</code> снова <b>включены</b>!",
+            parse_mode='HTML'
+        )
+
+
+async def bday_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Не присылать ДР из этой группы' прямо в ЛС у админа"""
+    query = update.callback_query
+    await query.answer()
+
+    _, action, target_chat_id = query.data.split(":", 2)
+    user_id = query.from_user.id
+
+    if action == "off":
+        await database.set_admin_bday_mute(target_chat_id, user_id, mute=True)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔔 Включить обратно", callback_data=f"bday_mute:on:{target_chat_id}")
+        ]])
+        await query.edit_message_reply_markup(reply_markup=kb)
+        await query.message.reply_text("🔕 Уведомления о ДР из этой группы отключены.")
+    else:
+        await database.set_admin_bday_mute(target_chat_id, user_id, mute=False)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔕 Не присылать ДР из этой группы", callback_data=f"bday_mute:off:{target_chat_id}")
+        ]])
+        await query.edit_message_reply_markup(reply_markup=kb)
+        await query.message.reply_text("🔔 Уведомления о ДР из этой группы снова включены!")

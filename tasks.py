@@ -6,6 +6,7 @@ import os
 import re
 import logging
 from telegram.ext import ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime, timedelta
 
 import config
@@ -386,7 +387,7 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _notify_group_admins_about_bday(context: ContextTypes.DEFAULT_TYPE, chat_id: int, bdays: list, target_dt: datetime):
-    """Пытается отправить напоминание в ЛС админам группы за 3 дня до ДР"""
+    """Пытается отправить напоминание в ЛС админам группы за 3 дня до ДР (с учетом отписок)"""
     try:
         chat_obj = await context.bot.get_chat(chat_id)
         chat_title = html.escape(chat_obj.title or "группе")
@@ -399,14 +400,20 @@ async def _notify_group_admins_about_bday(context: ContextTypes.DEFAULT_TYPE, ch
     alert_text = (
         f"🔔 <b>Напоминание для администратора чата «{chat_title}»</b>\n\n"
         f"Через 3 дня (<b>{target_dt.day:02d}.{target_dt.month:02d}</b>) День рождения празднует: <b>{names}</b> 🎂\n"
-        "Самое время подготовить поздравление или организовать сбор на подарок!"
+        "Самое время подготовить поздравление или организовать сбор на подарок!\n\n"
+        f"<i>Если вы не хотите получать уведомления о ДР из этой группы, нажмите кнопку ниже или отправьте:</i>\n"
+        f"<code>/mute_bday {chat_id}</code>"
     )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔕 Не присылать ДР из этой группы", callback_data=f"bday_mute:off:{chat_id}")
+    ]])
 
     for adm_id in admin_ids:
+        if await database.is_admin_bday_muted(chat_id, adm_id):
+            continue
         try:
-            await context.bot.send_message(chat_id=adm_id, text=alert_text, parse_mode='HTML')
+            await context.bot.send_message(chat_id=adm_id, text=alert_text, parse_mode='HTML', reply_markup=kb)
         except Exception:
-            # Если админ никогда не открывал ЛС с ботом — тихо пропускаем
             pass
 
 
