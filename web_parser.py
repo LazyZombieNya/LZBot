@@ -201,77 +201,92 @@ def extract_urls(text: str) -> list:
 
 async def transcribe_via_audio(clean_url: str, base_ydl_opts: dict) -> str | None:
     """
-    Резервный (третий) уровень: если субтитры недоступны (429 / нет речи в разметке /
-    защита YouTube), скачиваем минимальный по весу аудиопоток и прогоняем его через
-    Whisper (Groq). Groq лимитирует файл ~25MB, поэтому берём самое лёгкое аудио
-    и сразу конвертируем в mp3 с низким битрейтом через ffmpeg (обязательно должен
-    быть установлен в системе, куда деплоится бот).
+    Скачивает минимальный по весу медиапоток через yt-dlp и распознаёт речь.
+    Работает ДАЖЕ БЕЗ установленного ffmpeg (напрямую отдает .m4a/.webm/.mp4 в Whisper или Gemini).
     """
-    if not whisper_client:
-        logger.warning("GROQ_API_KEY не задан — Whisper-фолбэк недоступен.")
-        return None
-
-    if not FFMPEG_LOCATION:
-        logger.warning("ffmpeg недоступен — пропускаем аудио-фолбэк для этого видео.")
-        return None
+    import ai_core
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        out_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
-        audio_opts = {
-            **base_ydl_opts,
-            'format': 'worstaudio/bestaudio',  # самый лёгкий поток — экономим трафик и время
-            'outtmpl': out_template,
-            'ffmpeg_location': FFMPEG_LOCATION,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '64',  # 64kbps достаточно для распознавания речи
-            }],
-        }
+        out_template = os.path.join(tmpdir, "media.%(ext)s")
+
+        # Если ffmpeg есть — жмём в легкий mp3.
+        # Если ffmpeg НЕТ — просим yt-dlp скачать готовый однофайловый поток (m4a/webm/mp4) без склейки!
+        if FFMPEG_LOCATION:
+            audio_opts = {
+                **base_ydl_opts,
+                'format': 'worstaudio/bestaudio/worst',
+                'outtmpl': out_template,
+                'ffmpeg_location': FFMPEG_LOCATION,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '64',
+                }],
+            }
+        else:
+            audio_opts = {
+                **base_ydl_opts,
+                # Берем одиночный аудиофайл (m4a/webm), а если у сайта (например, Instagram/TikTok)
+                # видео и звук идут одним мелким mp4-файлом — берем самый легкий mp4 до 20 МБ
+                'format': 'worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/worst[ext=mp4]/worst',
+                'outtmpl': out_template,
+            }
+
         audio_opts.pop('skip_download', None)
 
         def download() -> str | None:
             with yt_dlp.YoutubeDL(audio_opts) as ydl:
                 ydl.download([clean_url])
             for fname in os.listdir(tmpdir):
-                return os.path.join(tmpdir, fname)
+                full_p = os.path.join(tmpdir, fname)
+                if os.path.isfile(full_p) and not fname.endswith(".part"):
+                    return full_p
             return None
 
         try:
-            audio_path = await asyncio.wait_for(asyncio.to_thread(download), timeout=90.0)
+            media_path = await asyncio.wait_for(asyncio.to_thread(download), timeout=90.0)
         except asyncio.TimeoutError:
-            logger.warning("Таймаут скачивания аудио для Whisper.")
+            logger.warning("Таймаут скачивания медиа для распознавания речи.")
             return None
         except Exception as e:
-            logger.warning(f"Ошибка скачивания аудио для Whisper: {e}")
-            # Это последний рубеж фолбэков — если и тут ошибка похожа на куки/антибот, стоит написать
+            logger.warning(f"Ошибка скачивания медиа для распознавания речи: {e}")
             await _maybe_alert_cookie_issue(str(e))
             return None
 
-        if not audio_path or not os.path.exists(audio_path):
+        if not media_path or not os.path.exists(media_path):
             return None
 
-        size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        size_mb = os.path.getsize(media_path) / (1024 * 1024)
         if size_mb > 24:
-            logger.warning(f"Аудио слишком большое для Whisper ({size_mb:.1f}MB) — пропускаем видео целиком.")
+            logger.warning(f"Медиафайл слишком большой ({size_mb:.1f}MB) — пропускаем распознавание.")
             return None
+
+        # Определяем корректный MIME-тип по расширению скачанного файла
+        ext = os.path.splitext(media_path)[1].lower().lstrip(".")
+        mime_map = {
+            "mp3": "audio/mpeg",
+            "m4a": "audio/mp4",
+            "mp4": "video/mp4",
+            "webm": "audio/webm",
+            "ogg": "audio/ogg",
+            "opus": "audio/ogg",
+            "wav": "audio/wav",
+        }
+        mime_type = mime_map.get(ext, "audio/mp4")
 
         try:
-            with open(audio_path, "rb") as f:
-                transcript = await whisper_client.audio.transcriptions.create(
-                    model=WHISPER_MODEL,
-                    file=f,
-                    response_format="text",
-                )
-            text = transcript if isinstance(transcript, str) else getattr(transcript, "text", "")
-            text = text.strip()
+            with open(media_path, "rb") as f:
+                media_bytes = f.read()
+
+            # Сначала пробуем наш единый каскад из ai_core (Groq Whisper -> Gemini Flash)
+            text = await ai_core.transcribe_audio(media_bytes, mime_type=mime_type)
             if text:
-                logger.info(f"✅ УСПЕШНО ТРАНСКРИБИРОВАНО ЧЕРЕЗ WHISPER: {text[:100]}...")
+                logger.info(f"✅ УСПЕШНО ТРАНСКРИБИРОВАНО ВИДЕО ({ext}, {size_mb:.1f}MB): {text[:100]}...")
                 return text
-            return None
         except Exception as e:
-            logger.warning(f"Ошибка транскрибации через Whisper (Groq): {e}")
-            return None
+            logger.warning(f"Ошибка транскрибации видео через каскад ai_core: {e}")
+
+        return None
 
 
 async def parse_youtube(url: str) -> str:

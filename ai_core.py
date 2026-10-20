@@ -381,7 +381,14 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
         try:
             # Сценарий STT через Groq Whisper
             if provider == "groq" and "whisper" in model_name.lower() and config.GROQ_API_KEY:
-                ext = "ogg" if "ogg" in mime_type else "mp3"
+                if "ogg" in mime_type:
+                    ext = "ogg"
+                elif "webm" in mime_type:
+                    ext = "webm"
+                elif "mp4" in mime_type:
+                    ext = "mp4"
+                else:
+                    ext = "mp3"
                 transcript = await asyncio.wait_for(
                     groq_client.audio.transcriptions.create(
                         file=(f'audio.{ext}', audio_bytes, mime_type),

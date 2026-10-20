@@ -349,6 +349,7 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
     for chat_id_str, mode in enabled_chats:
         try:
             chat_id = int(chat_id_str)
+            is_silent = await database.get_silent_responses(chat_id)
             todays_events = await database.get_custom_events_by_date(chat_id, now.day, now.month)
 
             # 1. Отправка поздравления в сам чат
@@ -356,7 +357,9 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
                 # Режим "ВСЕ ПРАЗДНИКИ": отправляем полную сводку на сегодня (свои + общие РФ)
                 msg = await holidays.build_today_holidays_message(chat_id, dt=now)
                 if msg:
-                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=msg, parse_mode='HTML', disable_notification=is_silent
+                    )
             elif mode == 1 and todays_events:
                 # Режим "ТОЛЬКО СВОИ": пишем только если сегодня есть кастомный праздник или ДР
                 events_desc = "\n".join(
@@ -369,9 +372,11 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
                     "Используй праздничные эмодзи, но не пиши тег [REACTION]."
                 )
                 reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
-                reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply or "").strip()
+                reply = holidays.md_to_html(reply)
                 if reply:
-                    await context.bot.send_message(chat_id=chat_id, text=reply, parse_mode='HTML')
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=reply, parse_mode='HTML', disable_notification=is_silent
+                    )
 
             # 2. Проверка для ГРУПП: есть ли через 3 дня чей-то День рождения, чтобы предупредить админов в ЛС
             if chat_id < 0:
@@ -424,9 +429,12 @@ async def friday_upcoming_events_job(context: ContextTypes.DEFAULT_TYPE):
     for chat_id_str, _mode in enabled_chats:
         try:
             chat_id = int(chat_id_str)
+            is_silent = await database.get_silent_responses(chat_id)
             preview = await holidays.build_friday_preview(chat_id, friday_dt=now)
             if preview:
-                await context.bot.send_message(chat_id=chat_id, text=preview, parse_mode='HTML')
+                await context.bot.send_message(
+                    chat_id=chat_id, text=preview, parse_mode='HTML', disable_notification=is_silent
+                )
         except Exception as e:
             logger.error(f"Ошибка пятничного анонса в чате {chat_id_str}: {e}")
 
@@ -435,12 +443,14 @@ async def monday_weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждый понедельник утром отправляет расписание праздников и ДР на неделю"""
     now = datetime.now(config.BOT_TIMEZONE)
     enabled_chats = await database.get_all_holiday_enabled_chats()
-    logger.info(f"Запуск дайджеста понедельника. Активных чатов: {len(enabled_chats)}")
     for chat_id_str, _mode in enabled_chats:
         try:
             chat_id = int(chat_id_str)
+            is_silent = await database.get_silent_responses(chat_id)
             digest = await holidays.build_monday_digest(chat_id, start_dt=now)
             if digest:
-                await context.bot.send_message(chat_id=chat_id, text=digest, parse_mode='HTML')
+                await context.bot.send_message(
+                    chat_id=chat_id, text=digest, parse_mode='HTML', disable_notification=is_silent
+                )
         except Exception as e:
             logger.error(f"Ошибка еженедельного дайджеста в чате {chat_id_str}: {e}")
