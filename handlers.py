@@ -332,7 +332,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if part_text:
             user_text_only += part_text + "\n\n"
 
-        if msg.photo or msg.document or msg.voice or msg.audio:
+        if msg.photo or msg.video or msg.video_note or msg.animation or msg.document or msg.voice or msg.audio:
             media_msg = msg
 
     # Отделяем чистый текст юзера от будущего контекста с цитатами
@@ -355,7 +355,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Умный поиск медиа в реплаях
     if not (
-            media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio) and trigger_msg.reply_to_message:
+            media_msg.photo or media_msg.video or media_msg.video_note or
+            media_msg.animation or media_msg.document or media_msg.voice or media_msg.audio
+    ) and trigger_msg.reply_to_message:
         media_msg = trigger_msg.reply_to_message
 
     # Решение принимается до скачивания медиа, списания запроса и любых сообщений ожидания.
@@ -396,7 +398,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_reply_to_other or "?" not in text_without_links:
                 return
             # Без запроса к боту не анализируем вложения и не гадаем по их подписи.
-            if media_msg.photo or media_msg.document or media_msg.voice or media_msg.audio:
+            if (
+                    media_msg.photo or media_msg.video or media_msg.video_note or
+                    media_msg.animation or media_msg.document or media_msg.voice or media_msg.audio
+            ):
                 return
             last_time = config.last_request_time.get(history_key)
             if last_time and (datetime.now(timezone.utc) - last_time).total_seconds() < config.RATE_LIMIT_SECONDS_PER_USER:
@@ -437,44 +442,104 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.edit_text("⚠️ Ошибка распознавания голоса (все аудио-сервисы временно недоступны).")
             return
 
-    # === ОБРАБОТКА ПРИКРЕПЛЕННЫХ ФАЙЛОВ ===
+    video_grid_bytes = None
+
+    # === ОБРАБОТКА ВИДЕОФАЙЛОВ, КРУЖКОВ И GIF (Звук + Раскадровка 2x2 для вшитых субтитров) ===
+    if media_msg.video or media_msg.video_note or media_msg.animation:
+        vid_obj = media_msg.video or media_msg.video_note or media_msg.animation
+        is_gif = bool(media_msg.animation)
+
+        if vid_obj.file_size and vid_obj.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("⚠️ Видео/GIF слишком большое (лимит Telegram Bot API — 20 МБ).")
+            return
+
+        wait_msg = await update.message.reply_text(
+            "🎬 Анализирую кадры и текст на GIF..." if is_gif else "🎬 Слушаю звук и смотрю субтитры на видео...",
+            disable_notification=True
+        )
+        try:
+            file = await vid_obj.get_file()
+            video_bytes = bytes(await file.download_as_bytearray())
+            transcript, video_grid_bytes = await web_parser.extract_video_file_context(video_bytes, is_gif=is_gif)
+
+            media_label = "GIF-анимацию" if is_gif else "видеофайл"
+            if transcript:
+                text = (
+                            text + f"\n\n[Пользователь отправил {media_label}. Распознанная речь из видео]:\n{transcript}").strip()
+            else:
+                text = (
+                            text + f"\n\n[Пользователь отправил {media_label} без устной речи (или только с музыкой/текстом на экране). "
+                                   f"Проанализируй прикрепленную раскадровку (4 кадра из видео), прочитай вшитые субтитры/надписи и ответь по сути.]").strip()
+            await wait_msg.delete()
+        except Exception as e:
+            logger.error(f"Ошибка анализа видео/GIF: {e}")
+            await wait_msg.edit_text("⚠️ Не удалось обработать видеофайл.")
+            return
+    # === ОБРАБОТКА ПРИКРЕПЛЕННЫХ ФАЙЛОВ (ДОКУМЕНТОВ) ===
     elif media_msg.document:
         doc = media_msg.document
         if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-            await update.message.reply_text("⚠️ Файл слишком большой (лимит 20 МБ).")
+            await update.message.reply_text("⚠️ Файл слишком большой (лимит Telegram Bot API — 20 МБ).")
             return
 
-        wait_msg = await update.message.reply_text(f"📄 Читаю файл {doc.file_name}...", disable_notification=True)
-        try:
-            file = await doc.get_file()
-            file_bytes = bytes(await file.download_as_bytearray())
+        mime = (doc.mime_type or "").lower()
+        fname_lower = (doc.file_name or "").lower()
+        is_video_doc = mime.startswith("video/") or fname_lower.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi"))
+        is_gif_doc = mime == "image/gif" or fname_lower.endswith(".gif")
 
-            # Если это PDF
-            if doc.mime_type == 'application/pdf':
-                pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
-                doc_text = "".join([page.get_text() for page in pdf])
-                text += f"\n\n[Содержимое прикрепленного PDF файла {doc.file_name}]:\n{doc_text[:6000]}..."
-
-            # Если это Word документ (DOCX)
-            elif doc.file_name.lower().endswith('.docx'):
-                docx_file = io.BytesIO(file_bytes)
-                document = Document(docx_file)
-                doc_text = "\n".join([para.text for para in document.paragraphs])
-                text += f"\n\n[Содержимое прикрепленного Word документа {doc.file_name}]:\n{doc_text[:6000]}..."
-
-                # Если это текстовый файл, код или логи (.txt, .py, .log, .json и т.д.)
-            else:
-                try:
-                    doc_text = file_bytes.decode('utf-8')
-                    text += f"\n\n[Содержимое прикрепленного файла {doc.file_name}]:\n{doc_text[:6000]}..."
-                except UnicodeDecodeError:
-                    # Вместо pass добавляем системное сообщение для ИИ!
-                    text += f"\n\n[Системное сообщение: Пользователь прикрепил файл {doc.file_name}, но это неизвестный бинарный формат. Бот не смог извлечь из него текст. Сообщи об этом пользователю.]"
+        # 1. Если документ — это видеофайл без сжатия или файл .gif
+        if is_video_doc or is_gif_doc:
+            wait_msg = await update.message.reply_text(
+                f"🎬 Анализирую медиа-документ {doc.file_name}...", disable_notification=True
+            )
+            try:
+                file = await doc.get_file()
+                file_bytes = bytes(await file.download_as_bytearray())
+                transcript, video_grid_bytes = await web_parser.extract_video_file_context(
+                    file_bytes, is_gif=is_gif_doc
+                )
+                if transcript:
+                    text = (
+                                text + f"\n\n[Пользователь отправил видео-документ {doc.file_name}. Распознанная речь]:\n{transcript}").strip()
+                else:
+                    text = (text + f"\n\n[Пользователь отправил медиа-документ {doc.file_name} без устной речи. "
+                                   f"Проанализируй прикрепленную раскадровку (4 кадра), прочитай субтитры/надписи и ответь по сути.]").strip()
                 await wait_msg.delete()
-        except Exception as e:
-            logger.error(f"Ошибка чтения файла: {e}")
-            await wait_msg.edit_text("⚠️ Ошибка при чтении файла.")
-            return
+            except Exception as e:
+                logger.error(f"Ошибка анализа видео-документа: {e}")
+                await wait_msg.edit_text("⚠️ Ошибка при обработке видео-документа.")
+                return
+
+        # 2. Обычные документы (PDF, DOCX, текстовые файлы и код)
+        else:
+            wait_msg = await update.message.reply_text(f"📄 Читаю файл {doc.file_name}...",
+                                                       disable_notification=True)
+            try:
+                file = await doc.get_file()
+                file_bytes = bytes(await file.download_as_bytearray())
+
+                if mime == 'application/pdf' or fname_lower.endswith('.pdf'):
+                    pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
+                    doc_text = "".join([page.get_text() for page in pdf])
+                    text += f"\n\n[Содержимое прикрепленного PDF файла {doc.file_name}]:\n{doc_text[:6000]}..."
+
+                elif fname_lower.endswith('.docx'):
+                    docx_file = io.BytesIO(file_bytes)
+                    document = Document(docx_file)
+                    doc_text = "\n".join([para.text for para in document.paragraphs])
+                    text += f"\n\n[Содержимое прикрепленного Word документа {doc.file_name}]:\n{doc_text[:6000]}..."
+
+                else:
+                    try:
+                        doc_text = file_bytes.decode('utf-8')
+                        text += f"\n\n[Содержимое прикрепленного файла {doc.file_name}]:\n{doc_text[:6000]}..."
+                    except UnicodeDecodeError:
+                        text += f"\n\n[Системное сообщение: Пользователь прикрепил файл {doc.file_name}, но это неизвестный бинарный формат. Бот не смог извлечь из него текст. Сообщи об этом пользователю.]"
+                await wait_msg.delete()
+            except Exception as e:
+                logger.error(f"Ошибка чтения файла: {e}")
+                await wait_msg.edit_text("⚠️ Ошибка при чтении файла.")
+                return
 
     # Получаем настройку тихих ответов перед отправкой
     is_silent = await database.get_silent_responses(history_key)
@@ -564,8 +629,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Прогоняем текст через парсер ссылок перед отправкой в ИИ
             enriched_prompt, parsed_image_bytes = await web_parser.process_message_for_urls(prompt_text)
 
-            # Если юзер не прикрепил картинку напрямую в телегу, но кинул ссылку на неё - берем картинку по ссылке
-            final_image_bytes = image_bytes if image_bytes else parsed_image_bytes
+            # Если есть фото, раскадровка видео/GIF или картинка по ссылке — передаем в Vision-модель
+            final_image_bytes = image_bytes or video_grid_bytes or parsed_image_bytes
 
             # Передаем обогащенный промпт (с текстом сайтов) и картинку в LLM
             gen_task = asyncio.create_task(
@@ -911,14 +976,25 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
 
     # --- БЫСТРЫЙ ТЕСТ РАССЫЛОК ДЛЯ АДМИНА ---
-    if context.args and len(context.args) == 1 and context.args[0].lower() in ("test_mon", "test_fri", "test_day"):
+    if context.args and len(context.args) == 1 and context.args[0].lower() in ("test_mon", "test_fri", "test_day",
+                                                                               "test_bday"):
         if not await check_admin_rights(update, context):
             return
+        import tasks
         cmd = context.args[0].lower()
         now = datetime.now(config.BOT_TIMEZONE)
-        wait_msg = await update.message.reply_text(f"🧪 Тестирую задачу <code>{cmd}</code>...", parse_mode='HTML')
+        is_silent = await database.get_silent_responses(chat_key)
+        wait_msg = await update.message.reply_text(
+            f"🧪 Тестирую задачу <code>{cmd}</code>...", parse_mode='HTML', disable_notification=True
+        )
         try:
-            if cmd == "test_mon":
+            if cmd == "test_bday":
+                sent = await tasks.check_and_send_upcoming_bday_alerts(context, target_chat_id=chat_key)
+                res = (
+                    f"✅ Проверка ДР (на 1–3 дня вперед) завершена!\n"
+                    f"Отправлено уведомлений админам в ЛС: <b>{sent}</b> шт."
+                )
+            elif cmd == "test_mon":
                 res = await holidays.build_monday_digest(chat_key, start_dt=now)
                 if not res:
                     res = "ℹ️ На этой неделе нет запланированных ДР, особых событий чата или праздничных выходных среди недели, поэтому в понедельник бот промолчит."
@@ -928,8 +1004,10 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     res = "ℹ️ На следующей неделе (Пн–Вс от текущей даты) в этом чате нет своих ДР или особых дат, поэтому пятничное сообщение не отправляется."
             else:
                 res = await holidays.build_today_holidays_message(chat_key, dt=now)
+                # При тесте дня заодно проверяем отправку ДР в личку админам!
+                await tasks.check_and_send_upcoming_bday_alerts(context, target_chat_id=chat_key)
             await wait_msg.delete()
-            await update.message.reply_text(res, parse_mode='HTML')
+            await update.message.reply_text(res, parse_mode='HTML', disable_notification=is_silent)
         except Exception as e:
             await wait_msg.edit_text(f"⚠️ Ошибка теста: {e}")
         return

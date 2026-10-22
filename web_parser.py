@@ -487,6 +487,52 @@ async def parse_generic_video(url: str) -> str:
 
     return video_info + body
 
+async def extract_video_file_context(video_bytes: bytes, is_gif: bool = False) -> tuple[str | None, bytes | None]:
+    """
+    Для прикрепленных видео, кружков и GIF:
+    1) Извлекает аудио и распознает речь через каскад (если не GIF).
+    2) Через ffmpeg делает 1 картинку-коллаж (2x2 из 4 кадров в разное время видео),
+       чтобы ИИ мог прочитать вшитые в видео субтитры/текст и увидеть суть без покадрового спама токенами.
+    """
+    import ai_core
+
+    transcript = None
+    grid_image_bytes = None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, "input_media.mp4")
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
+
+        # 1. Извлекаем речь (если это не беззвучная GIF-анимация)
+        if not is_gif:
+            try:
+                transcript = await ai_core.transcribe_audio(video_bytes, mime_type="video/mp4")
+            except Exception as e:
+                logger.warning(f"Не удалось распознать речь из видеофайла: {e}")
+
+        # 2. Делаем легкий коллаж 2x2 из 4 кадров видео через ffmpeg (для чтения вшитых субтитров и видеоряда)
+        ffmpeg_bin = os.path.join(FFMPEG_LOCATION, "ffmpeg") if FFMPEG_LOCATION else shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            out_jpg = os.path.join(tmpdir, "grid.jpg")
+            # Берем 4 кадра с интервалом и собираем в единую картинку tile=2x2 шириной 640px на кадр
+            cmd = [
+                ffmpeg_bin, "-y", "-i", in_path,
+                "-vf", "select='isnan(prev_selected_t)+gte(t-prev_selected_t,1.5)',scale=640:-1,tile=2x2",
+                "-frames:v", "1", "-q:v", "5", out_jpg
+            ]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await asyncio.wait_for(proc.wait(), timeout=15.0)
+                if os.path.exists(out_jpg) and os.path.getsize(out_jpg) > 0:
+                    with open(out_jpg, "rb") as img_f:
+                        grid_image_bytes = img_f.read()
+            except Exception as e:
+                logger.warning(f"Не удалось создать раскадровку видео через ffmpeg: {e}")
+
+    return transcript, grid_image_bytes
 
 async def fetch_url_content(url: str):
     if "youtube.com" in url or "youtu.be" in url:

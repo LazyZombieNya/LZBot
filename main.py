@@ -87,7 +87,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handlers.bday_mute_callback, pattern="^bday_mute:"))
 
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & ~filters.COMMAND,
+        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION) & ~filters.COMMAND,
         handlers.handle_message, block=False))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handlers.welcome_new_member))
 

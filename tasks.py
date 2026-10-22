@@ -340,10 +340,50 @@ async def check_expirations_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+async def check_and_send_upcoming_bday_alerts(context: ContextTypes.DEFAULT_TYPE, target_chat_id: int = None) -> int:
+    """
+    Проверяет ДР на ближайшие 3 дня (1..3 дня вперед) и отправляет уведомления админам в ЛС.
+    Возвращает количество отправленных уведомлений.
+    """
+    now = datetime.now(config.BOT_TIMEZONE)
+    enabled_chats = await database.get_all_holiday_enabled_chats()
+    chat_ids = {int(cid) for cid, _ in enabled_chats}
+    if target_chat_id:
+        chat_ids.add(int(target_chat_id))
+
+    sent_count = 0
+    for chat_id in chat_ids:
+        # Проверяем только группы (у групп в Telegram отрицательный ID)
+        if chat_id >= 0:
+            continue
+
+        all_events = await database.get_custom_events(chat_id)
+        bdays_only = [e for e in all_events if e.get("category") == "birthday"]
+        if not bdays_only:
+            continue
+
+        # Проверяем горизонт от 1 до 3 дней вперед
+        for days_ahead in (3, 2, 1):
+            # При ежедневном автозапуске (target_chat_id is None) шлем ровно за 3 дня,
+            # а при ручном тесте (target_chat_id задан) — показываем все ДР в ближайшие 1..3 дня!
+            if target_chat_id is None and days_ahead != 3:
+                continue
+
+            target_dt = now + timedelta(days=days_ahead)
+            matching = [
+                e for e in bdays_only
+                if e["day"] == target_dt.day and e["month"] == target_dt.month
+            ]
+            if matching:
+                sent_count += await _notify_group_admins_about_bday(
+                    context, chat_id, matching, target_dt, days_ahead=days_ahead
+                )
+    return sent_count
+
+
 async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневная утренняя рассылка в 09:00 с учетом режима (1 - только свои, 2 - все) + алерт админам за 3 дня до ДР"""
     now = datetime.now(config.BOT_TIMEZONE)
-    in_3_days = now + timedelta(days=3)
     enabled_chats = await database.get_all_holiday_enabled_chats()
 
     for chat_id_str, mode in enabled_chats:
@@ -354,14 +394,12 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
 
             # 1. Отправка поздравления в сам чат
             if mode == 2:
-                # Режим "ВСЕ ПРАЗДНИКИ": отправляем полную сводку на сегодня (свои + общие РФ)
                 msg = await holidays.build_today_holidays_message(chat_id, dt=now)
                 if msg:
                     await context.bot.send_message(
                         chat_id=chat_id, text=msg, parse_mode='HTML', disable_notification=is_silent
                     )
             elif mode == 1 and todays_events:
-                # Режим "ТОЛЬКО СВОИ": пишем только если сегодня есть кастомный праздник или ДР
                 events_desc = "\n".join(
                     [f"- {'День рождения' if e['category']=='birthday' else 'Праздник чата'}: {e['title']}" for e in todays_events]
                 )
@@ -377,34 +415,38 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(
                         chat_id=chat_id, text=reply, parse_mode='HTML', disable_notification=is_silent
                     )
-
-            # 2. Проверка для ГРУПП: есть ли через 3 дня чей-то День рождения, чтобы предупредить админов в ЛС
-            if chat_id < 0:
-                upcoming_bdays = [
-                    e for e in await database.get_custom_events_by_date(chat_id, in_3_days.day, in_3_days.month)
-                    if e["category"] == "birthday"
-                ]
-                if upcoming_bdays:
-                    await _notify_group_admins_about_bday(context, chat_id, upcoming_bdays, in_3_days)
-
         except Exception as e:
             logger.error(f"Ошибка утренней рассылки праздников в чате {chat_id_str}: {e}")
 
+    # 2. Запускаем проверку ДР за 3 дня для всех групп
+    await check_and_send_upcoming_bday_alerts(context)
 
-async def _notify_group_admins_about_bday(context: ContextTypes.DEFAULT_TYPE, chat_id: int, bdays: list, target_dt: datetime):
-    """Пытается отправить напоминание в ЛС админам группы за 3 дня до ДР (с учетом отписок)"""
+
+async def _notify_group_admins_about_bday(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, bdays: list, target_dt: datetime, days_ahead: int = 3
+) -> int:
+    """Отправляет напоминание в ЛС админам группы о скором ДР (с учетом отписок)"""
+    admin_ids = set()
+    chat_title = "группе"
     try:
         chat_obj = await context.bot.get_chat(chat_id)
         chat_title = html.escape(chat_obj.title or "группе")
         admins = await context.bot.get_chat_administrators(chat_id)
-        admin_ids = [a.user.id for a in admins if not a.user.is_bot]
-    except Exception:
-        return
+        for a in admins:
+            if not a.user.is_bot:
+                admin_ids.add(a.user.id)
+    except Exception as e:
+        logger.warning(f"Не удалось получить список админов чата {chat_id}: {e}")
 
+    # Обязательно добавляем владельца бота (на случай режима анонимного админа в группе)
+    if config.ADMIN_ID:
+        admin_ids.add(int(config.ADMIN_ID))
+
+    days_word = {1: "Завтра", 2: "Через 2 дня", 3: "Через 3 дня"}.get(days_ahead, f"Через {days_ahead} дн.")
     names = ", ".join(html.escape(b["title"]) for b in bdays)
     alert_text = (
         f"🔔 <b>Напоминание для администратора чата «{chat_title}»</b>\n\n"
-        f"Через 3 дня (<b>{target_dt.day:02d}.{target_dt.month:02d}</b>) День рождения празднует: <b>{names}</b> 🎂\n"
+        f"{days_word} (<b>{target_dt.day:02d}.{target_dt.month:02d}</b>) День рождения празднует: <b>{names}</b> 🎂\n"
         "Самое время подготовить поздравление или организовать сбор на подарок!\n\n"
         f"<i>Если вы не хотите получать уведомления о ДР из этой группы, нажмите кнопку ниже или отправьте:</i>\n"
         f"<code>/mute_bday {chat_id}</code>"
@@ -413,14 +455,18 @@ async def _notify_group_admins_about_bday(context: ContextTypes.DEFAULT_TYPE, ch
         InlineKeyboardButton("🔕 Не присылать ДР из этой группы", callback_data=f"bday_mute:off:{chat_id}")
     ]])
 
+    sent = 0
     for adm_id in admin_ids:
         if await database.is_admin_bday_muted(chat_id, adm_id):
+            logger.info(f"Админ {adm_id} отключил уведомления о ДР для чата {chat_id} — пропускаем.")
             continue
         try:
             await context.bot.send_message(chat_id=adm_id, text=alert_text, parse_mode='HTML', reply_markup=kb)
-        except Exception:
-            pass
-
+            sent += 1
+            logger.info(f"✅ Отправлено напоминание о ДР ({names}) админу {adm_id} в ЛС")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить напоминание о ДР в ЛС админу {adm_id}: {e}")
+    return sent
 
 async def friday_upcoming_events_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждую пятницу напоминает о ДР и особых датах следующей недели (если они есть)"""

@@ -13,86 +13,53 @@ logger = logging.getLogger(__name__)
 
 async def init_db():
     async with aiosqlite.connect(config.DB_PATH) as db:
-        # Таблица сообщений
+        # 1. Таблица сообщений
         await db.execute("""
-                         CREATE TABLE IF NOT EXISTS messages
-                         (
-                             id
-                             INTEGER
-                             PRIMARY
-                             KEY
-                             AUTOINCREMENT,
-                             chat_key
-                             TEXT,
-                             role
-                             TEXT,
-                             content
-                             TEXT,
-                             created_at
-                             TIMESTAMP
-                             DEFAULT
-                             CURRENT_TIMESTAMP
-                         )
-                         """)
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_key TEXT,
+                role TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-        # Таблица настроек (теперь всё создается сразу, без ALTER TABLE костылей)
+        # 2. Таблица настроек
         await db.execute("""
-                         CREATE TABLE IF NOT EXISTS settings
-                         (
-                             chat_key
-                             TEXT
-                             PRIMARY
-                             KEY,
-                             auto_fallback
-                             INTEGER
-                             DEFAULT
-                             1,
-                             keep_context
-                             INTEGER
-                             DEFAULT
-                             1,
-                             respond_all
-                             INTEGER
-                             DEFAULT
-                             0,
-                             silent_responses
-                             INTEGER
-                             DEFAULT
-                             0,
-                             show_tech_details
-                             INTEGER
-                             DEFAULT
-                             0,
-                             selected_model
-                             TEXT
-                         )
-                         """)
-        # На случай если таблица settings уже существовала без колонки праздников:
-        try:
-            await db.execute("ALTER TABLE settings ADD COLUMN holidays_enabled INTEGER DEFAULT 0")
-            await db.execute("ALTER TABLE custom_events ADD COLUMN created_by INTEGER DEFAULT 0")
-            # Таблица админов, отключивших уведомления о ДР в ЛС от конкретных групп
-            await db.execute("""
-                        CREATE TABLE IF NOT EXISTS admin_bday_mutes (
-                            chat_key TEXT,
-                            user_id INTEGER,
-                            PRIMARY KEY (chat_key, user_id)
-                        )
-                    """)
-        except Exception:
-            pass
+            CREATE TABLE IF NOT EXISTS settings (
+                chat_key TEXT PRIMARY KEY,
+                auto_fallback INTEGER DEFAULT 1,
+                keep_context INTEGER DEFAULT 1,
+                respond_all INTEGER DEFAULT 0,
+                silent_responses INTEGER DEFAULT 0,
+                show_tech_details INTEGER DEFAULT 0,
+                selected_model TEXT,
+                holidays_enabled INTEGER DEFAULT 0
+            )
+        """)
 
-        # Таблица для Дней Рождения и особых дат конкретного чата
+        # 3. Таблица для Дней Рождения и особых дат конкретного чата
         await db.execute("""
-                    CREATE TABLE IF NOT EXISTS custom_events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        chat_key TEXT,
-                        day INTEGER,
-                        month INTEGER,
-                        title TEXT,
-                        category TEXT DEFAULT 'holiday'
-                    )
-                """)
+            CREATE TABLE IF NOT EXISTS custom_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_key TEXT,
+                day INTEGER,
+                month INTEGER,
+                title TEXT,
+                category TEXT DEFAULT 'holiday',
+                created_by INTEGER DEFAULT 0
+            )
+        """)
+
+        # 4. Таблица админов, отключивших уведомления о ДР в ЛС от конкретных групп
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_bday_mutes (
+                chat_key TEXT,
+                user_id INTEGER,
+                PRIMARY KEY (chat_key, user_id)
+            )
+        """)
+
         await db.commit()
 
 
