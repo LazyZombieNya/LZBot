@@ -14,9 +14,11 @@ import config
 import database
 import ai_core
 import web_parser
+import rich_utils
 from access import consume_request_and_check, grant_lifetime_access, add_subscription_days
 
 logger = logging.getLogger(__name__)
+
 
 async def check_admin_rights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Проверяет, является ли пользователь админом чата или владельцем бота."""
@@ -34,21 +36,16 @@ async def check_admin_rights(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         return False
 
+
 def split_message(message: str):
-    parts = []
-    while len(message) > config.MAX_MESSAGE_LENGTH:
-        split_index = message[:config.MAX_MESSAGE_LENGTH].rfind("\n")
-        if split_index == -1:
-            split_index = config.MAX_MESSAGE_LENGTH
-        parts.append(message[:split_index])
-        message = message[split_index:]
-    parts.append(message)
-    return parts
+    return rich_utils.split_text(message, config.MAX_MESSAGE_LENGTH)
+
 
 async def ensure_user_lock(key):
     if key not in config.user_locks:
         config.user_locks[key] = asyncio.Lock()
     return config.user_locks[key]
+
 
 async def typing_sender(chat_id: int, context: ContextTypes.DEFAULT_TYPE, stop_event: asyncio.Event):
     while not stop_event.is_set():
@@ -61,6 +58,7 @@ async def typing_sender(chat_id: int, context: ContextTypes.DEFAULT_TYPE, stop_e
         except asyncio.TimeoutError:
             pass
 
+
 # ==========================================
 # БИЛЛИНГ И АДМИН-ПАНЕЛЬ
 # ==========================================
@@ -68,7 +66,7 @@ async def typing_sender(chat_id: int, context: ContextTypes.DEFAULT_TYPE, stop_e
 async def zombie_allowed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Скрытая команда выдачи вечного доступа (только для админа)"""
     if update.effective_user.id != config.ADMIN_ID:
-        return  # Если это не владелец, бот промолчит
+        return
 
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
@@ -81,7 +79,6 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
 
-    # ❗️ ЗАМЕНИ номер телефона на свой реальный номер по СБП
     text = (
         "💳 <b>Оформление подписки</b>\n\n"
         "Переведите нужную сумму по СБП (Сбер/Т-Банк) на номер:\n"
@@ -89,7 +86,6 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "После перевода нажмите кнопку ниже, чтобы я отправил запрос на проверку."
     )
 
-    # Бот понимает, где его вызвали, и предлагает нужный тариф
     if chat_type != "private":
         kb = [[InlineKeyboardButton("💵 Я оплатил 400₽ (Группа 30 дней)", callback_data=f"paid:group:{chat_id}")]]
     else:
@@ -131,7 +127,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     try:
-        # Отправляем сообщение на твой ADMIN_ID
+        # Отправляем сообщение на ADMIN_ID
         await context.bot.send_message(chat_id=config.ADMIN_ID, text=admin_text, reply_markup=InlineKeyboardMarkup(admin_kb), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Не удалось отправить уведомление админу: {e}")
@@ -149,15 +145,13 @@ async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
     action = parts[0]
     target_chat_id = int(parts[1])
 
-    # Сохраняем исходный текст заявки для истории и экранируем спецсимволы
-    safe_original_text = html.escape(query.message.text)
+    safe_original_text = html.escape(query.message.text or "")
 
     if action == "admin_confirm":
         tariff_type = parts[2]
         # Вызываем функцию начисления 30 дней!
         await add_subscription_days(target_chat_id, tariff_type, 30)
 
-        # Оставляем заявку в истории как подтвержденную (reply_markup=None убирает кнопки)
         new_text = f"✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА (30 дней)</b>\n\n<pre>{safe_original_text}</pre>"
         await query.edit_message_text(new_text, parse_mode='HTML', reply_markup=None)
 
@@ -168,9 +162,6 @@ async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
             pass
 
     elif action == "admin_reject":
-        target_user_id = int(parts[2])  # Тот, кто нажал кнопку "Оплатил"
-
-        # Оставляем заявку в истории как отклоненную
         new_text = f"❌ <b>ОПЛАТА ОТКЛОНЕНА</b>\n\n<pre>{safe_original_text}</pre>"
         await query.edit_message_text(new_text, parse_mode='HTML', reply_markup=None)
 
@@ -197,14 +188,13 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     respond_all = await database.get_respond_all(chat_key)
     silent_responses = await database.get_silent_responses(chat_key)
     show_tech_details = await database.get_show_tech_details(chat_key)
-    holidays_enabled = await database.get_holidays_enabled(chat_key)
+    holidays_mode = await database.get_holidays_mode(chat_key)
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
     btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
-    holidays_mode = await database.get_holidays_mode(chat_key)
     if holidays_mode == 1:
         btn6 = "🟡 Праздники: ТОЛЬКО СВОИ (ДР)"
     elif holidays_mode == 2:
@@ -234,7 +224,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_key = query.from_user.id if query.message.chat.type == 'private' else query.message.chat.id
-
     _, setting_type = query.data.split(":")
 
     if setting_type == "auto_fallback":
@@ -255,15 +244,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     respond_all = await database.get_respond_all(chat_key)
     silent_responses = await database.get_silent_responses(chat_key)
     show_tech_details = await database.get_show_tech_details(chat_key)
-    holidays_enabled = await database.get_holidays_enabled(chat_key)
-
+    holidays_mode = await database.get_holidays_mode(chat_key)
 
     btn1 = "🟢 Авто-переключение ИИ: ВКЛ" if auto_fallback else "🔴 Авто-переключение ИИ: ВЫКЛ"
     btn2 = "🟢 Контекст при смене: СОХРАНЯТЬ" if keep_context else "🔴 Контекст при смене: УДАЛЯТЬ"
     btn3 = "🟢 Отвечать на всё: ВКЛ" if respond_all else "🔴 Отвечать на всё: ВЫКЛ"
     btn4 = "🟢 Тихие ответы: ВКЛ" if silent_responses else "🔴 Тихие ответы: ВЫКЛ"
     btn5 = "🟢 Тех. детали сбоев: ВКЛ" if show_tech_details else "🔴 Тех. детали сбоев: СКРЫТЫ"
-    holidays_mode = await database.get_holidays_mode(chat_key)
     if holidays_mode == 1:
         btn6 = "🟡 Праздники: ТОЛЬКО СВОИ (ДР)"
     elif holidays_mode == 2:
@@ -282,6 +269,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_reply_markup(reply_markup=markup)
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
@@ -294,7 +282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history_key = user_id if chat_type == "private" else chat_id
 
     buffer_key = (history_key, user_id)
-    # --- НАЧАЛО: Группировка (буферизация) быстрых сообщений ---
+    # Группировка (буферизация) быстрых сообщений
     if buffer_key not in config.user_buffers:
         config.user_buffers[buffer_key] = []
 
@@ -328,7 +316,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Склеиваем текст и ищем медиа со всех полученных сообщений
     for msg in messages:
-        part_text = msg.text or msg.caption or ""
+        part_text = rich_utils.extract_any_message_text(msg)
         if part_text:
             user_text_only += part_text + "\n\n"
 
@@ -339,9 +327,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text_only = user_text_only.strip()
     text = user_text_only
 
-    # === МАГИЯ РЕПЛАЕВ И ПЕРЕСЫЛОК ===
+    # === МАГИЯ РЕПЛАЕВ И ПЕРЕСЫЛОК (С поддержкой RichMessage) ===
     if trigger_msg.reply_to_message:
-        replied_text = trigger_msg.reply_to_message.text or trigger_msg.reply_to_message.caption or ""
+        replied_text = rich_utils.extract_any_message_text(trigger_msg.reply_to_message)
         if replied_text:
             if is_reply_to_bot:
                 prefix = "[В ответ на твое сообщение]"
@@ -353,10 +341,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 text = f"{prefix}:\n«{replied_text}»"
 
-    # Умный поиск медиа в реплаях
+    # Поиск медиа в реплаях
     if not (
-            media_msg.photo or media_msg.video or media_msg.video_note or
-            media_msg.animation or media_msg.document or media_msg.voice or media_msg.audio
+        media_msg.photo or media_msg.video or media_msg.video_note or
+        media_msg.animation or media_msg.document or media_msg.voice or media_msg.audio
     ) and trigger_msg.reply_to_message:
         media_msg = trigger_msg.reply_to_message
 
@@ -369,23 +357,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean_word = re.sub(r'[^\wа-яА-ЯёЁ]', '', user_text_only).strip().lower()
     if clean_word in ("праздники", "праздник"):
         is_silent = await database.get_silent_responses(history_key)
-        wait_msg = await trigger_msg.reply_text("🎉 Смотрю календарь праздников...", disable_notification=True)
+        tracker = rich_utils.RichStatusTracker(context.bot, chat_id, chat_type, trigger_msg.message_id)
+        await tracker.step("🎉 Смотрю календарь праздников и особые даты чата...", force=True)
         try:
             holiday_reply = await holidays.build_today_holidays_message(history_key)
-            try:
-                await wait_msg.delete()
-            except Exception:
-                pass
-
-            for part in split_message(holiday_reply):
-                if part.strip():
-                    await trigger_msg.reply_text(part, parse_mode='HTML', disable_notification=is_silent)
+            await tracker.cleanup()
+            await rich_utils.send_rich_safe(
+                context.bot, chat_id, holiday_reply,
+                reply_to_message_id=trigger_msg.message_id,
+                disable_notification=is_silent
+            )
         except Exception as e:
             logger.error(f"Ошибка вывода праздников: {e}")
-            try:
-                await wait_msg.edit_text("⚠️ Не удалось загрузить календарь праздников.")
-            except Exception:
-                await trigger_msg.reply_text("⚠️ Не удалось загрузить календарь праздников.")
+            await tracker.cleanup()
+            await trigger_msg.reply_text("⚠️ Не удалось загрузить календарь праздников.")
         return
 
     if chat_type != "private" and not (is_mentioned or is_reply_to_bot):
@@ -397,10 +382,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text_without_links = re.sub(r'https?://\S+', '', user_text_only).strip()
             if is_reply_to_other or "?" not in text_without_links:
                 return
-            # Без запроса к боту не анализируем вложения и не гадаем по их подписи.
+             # Без запроса к боту не анализируем вложения и не гадаем по их подписи.
             if (
-                    media_msg.photo or media_msg.video or media_msg.video_note or
-                    media_msg.animation or media_msg.document or media_msg.voice or media_msg.audio
+                media_msg.photo or media_msg.video or media_msg.video_note or
+                media_msg.animation or media_msg.document or media_msg.voice or media_msg.audio
             ):
                 return
             last_time = config.last_request_time.get(history_key)
@@ -414,152 +399,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if prepared_reply is None:
                 return
 
-    # === ОБРАБОТКА ГОЛОСОВЫХ И АУДИО (Через отказоустойчивый каскад) ===
-    if media_msg.voice or media_msg.audio:
-        audio_obj = media_msg.voice if media_msg.voice else media_msg.audio
-
-        if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
-            await update.message.reply_text("⚠️ Аудио слишком большое (лимит 20 МБ).")
-            return
-
-        file = await audio_obj.get_file()
-        audio_bytes = bytes(await file.download_as_bytearray())
-
-        # Определяем MIME-тип файла (для голоса в Telegram это audio/ogg)
-        mime_type = getattr(audio_obj, 'mime_type', None) or 'audio/ogg'
-
-        wait_msg = await update.message.reply_text("🎧 Слушаю аудио/голосовое...", disable_notification=True)
-        try:
-            # Вызываем каскад моделей STT из ai_core
-            transcript = await ai_core.transcribe_audio(audio_bytes, mime_type=mime_type)
-
-            # Добавляем явный контекст, чтобы ИИ понимал формат исходного сообщения
-            text = (text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript}").strip()
-            print(text)
-            await wait_msg.delete()
-        except Exception as e:
-            logger.error(f"Ошибка каскада распознавания аудио: {e}")
-            await wait_msg.edit_text("⚠️ Ошибка распознавания голоса (все аудио-сервисы временно недоступны).")
-            return
-
-    video_grid_bytes = None
-
-    # === ОБРАБОТКА ВИДЕОФАЙЛОВ, КРУЖКОВ И GIF (Звук + Раскадровка 2x2 для вшитых субтитров) ===
-    if media_msg.video or media_msg.video_note or media_msg.animation:
-        vid_obj = media_msg.video or media_msg.video_note or media_msg.animation
-        is_gif = bool(media_msg.animation)
-
-        if vid_obj.file_size and vid_obj.file_size > 20 * 1024 * 1024:
-            await update.message.reply_text("⚠️ Видео/GIF слишком большое (лимит Telegram Bot API — 20 МБ).")
-            return
-
-        wait_msg = await update.message.reply_text(
-            "🎬 Анализирую кадры и текст на GIF..." if is_gif else "🎬 Слушаю звук и смотрю субтитры на видео...",
-            disable_notification=True
-        )
-        try:
-            file = await vid_obj.get_file()
-            video_bytes = bytes(await file.download_as_bytearray())
-            transcript, video_grid_bytes = await web_parser.extract_video_file_context(video_bytes, is_gif=is_gif)
-
-            media_label = "GIF-анимацию" if is_gif else "видеофайл"
-            if transcript:
-                text = (
-                            text + f"\n\n[Пользователь отправил {media_label}. Распознанная речь из видео]:\n{transcript}").strip()
-            else:
-                text = (
-                            text + f"\n\n[Пользователь отправил {media_label} без устной речи (или только с музыкой/текстом на экране). "
-                                   f"Проанализируй прикрепленную раскадровку (4 кадра из видео), прочитай вшитые субтитры/надписи и ответь по сути.]").strip()
-            await wait_msg.delete()
-        except Exception as e:
-            logger.error(f"Ошибка анализа видео/GIF: {e}")
-            await wait_msg.edit_text("⚠️ Не удалось обработать видеофайл.")
-            return
-    # === ОБРАБОТКА ПРИКРЕПЛЕННЫХ ФАЙЛОВ (ДОКУМЕНТОВ) ===
-    elif media_msg.document:
-        doc = media_msg.document
-        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-            await update.message.reply_text("⚠️ Файл слишком большой (лимит Telegram Bot API — 20 МБ).")
-            return
-
-        mime = (doc.mime_type or "").lower()
-        fname_lower = (doc.file_name or "").lower()
-        is_video_doc = mime.startswith("video/") or fname_lower.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi"))
-        is_gif_doc = mime == "image/gif" or fname_lower.endswith(".gif")
-
-        # 1. Если документ — это видеофайл без сжатия или файл .gif
-        if is_video_doc or is_gif_doc:
-            wait_msg = await update.message.reply_text(
-                f"🎬 Анализирую медиа-документ {doc.file_name}...", disable_notification=True
-            )
-            try:
-                file = await doc.get_file()
-                file_bytes = bytes(await file.download_as_bytearray())
-                transcript, video_grid_bytes = await web_parser.extract_video_file_context(
-                    file_bytes, is_gif=is_gif_doc
-                )
-                if transcript:
-                    text = (
-                                text + f"\n\n[Пользователь отправил видео-документ {doc.file_name}. Распознанная речь]:\n{transcript}").strip()
-                else:
-                    text = (text + f"\n\n[Пользователь отправил медиа-документ {doc.file_name} без устной речи. "
-                                   f"Проанализируй прикрепленную раскадровку (4 кадра), прочитай субтитры/надписи и ответь по сути.]").strip()
-                await wait_msg.delete()
-            except Exception as e:
-                logger.error(f"Ошибка анализа видео-документа: {e}")
-                await wait_msg.edit_text("⚠️ Ошибка при обработке видео-документа.")
-                return
-
-        # 2. Обычные документы (PDF, DOCX, текстовые файлы и код)
-        else:
-            wait_msg = await update.message.reply_text(f"📄 Читаю файл {doc.file_name}...",
-                                                       disable_notification=True)
-            try:
-                file = await doc.get_file()
-                file_bytes = bytes(await file.download_as_bytearray())
-
-                if mime == 'application/pdf' or fname_lower.endswith('.pdf'):
-                    pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
-                    doc_text = "".join([page.get_text() for page in pdf])
-                    text += f"\n\n[Содержимое прикрепленного PDF файла {doc.file_name}]:\n{doc_text[:6000]}..."
-
-                elif fname_lower.endswith('.docx'):
-                    docx_file = io.BytesIO(file_bytes)
-                    document = Document(docx_file)
-                    doc_text = "\n".join([para.text for para in document.paragraphs])
-                    text += f"\n\n[Содержимое прикрепленного Word документа {doc.file_name}]:\n{doc_text[:6000]}..."
-
-                else:
-                    try:
-                        doc_text = file_bytes.decode('utf-8')
-                        text += f"\n\n[Содержимое прикрепленного файла {doc.file_name}]:\n{doc_text[:6000]}..."
-                    except UnicodeDecodeError:
-                        text += f"\n\n[Системное сообщение: Пользователь прикрепил файл {doc.file_name}, но это неизвестный бинарный формат. Бот не смог извлечь из него текст. Сообщи об этом пользователю.]"
-                await wait_msg.delete()
-            except Exception as e:
-                logger.error(f"Ошибка чтения файла: {e}")
-                await wait_msg.edit_text("⚠️ Ошибка при чтении файла.")
-                return
-
-    # Получаем настройку тихих ответов перед отправкой
     is_silent = await database.get_silent_responses(history_key)
 
     # ПРОВЕРКА ДОСТУПА (БИЛЛИНГ)
     has_access = await consume_request_and_check(history_key, chat_type)
     if not has_access:
-        # Если это личка - показываем меню оплаты. Если группа - просим админов оплатить.
         tariff_msg = (
             "⭐️ <b>Доступ ограничен</b>\n\n"
             "Ваши пробные запросы закончились, или срок подписки истек. "
             "Чтобы бот снова начал отвечать, необходимо оформить подписку. Введите /pay для просмотра тарифов."
         )
-        # Отвечаем юзеру только если он напрямую тегнул бота или это личка,
-        # Проверяем ник бота только в чисто тексте юзера!
         if is_reply_to_bot or chat_type == "private" or (
                 context.bot.username and f"@{context.bot.username.lower()}" in user_text_only.lower()):
             await update.message.reply_text(tariff_msg, parse_mode='HTML')
         return
-
 
     now = datetime.now(timezone.utc)
     last_time = config.last_request_time.get(history_key)
@@ -567,107 +420,212 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     config.last_request_time[history_key] = now
 
-    # СКАЧИВАНИЕ КАРТИНКИ
-    image_bytes = None
-    if media_msg.photo:
-        # Берем самую большую версию картинки [-1]
-        photo_file = await media_msg.photo[-1].get_file()  # <--- ИМЕННО MEDIA_MSG!
-        image_bytes = bytes(await photo_file.download_as_bytearray())
-        # Если юзер скинул просто фото без текста, даем ИИ скрытую системную инструкцию
-        if not text:
-            text = (
-                "[Системная пометка: Пользователь отправил картинку без текста. "
-                "Изучи её и отреагируй как живой участник чата. Обязательно учитывай наш предыдущий контекст диалога. "
-                "Если это мем или шутка — посмейся или ответь встречной шуткой. "
-                "Если текст или интерфейс на иностранном языке — помоги перевести или объясни суть. "
-                "Если это просто фото — прокомментируй его по-человечески. "
-                "СТРОГО ЗАПРЕЩЕНО использовать фразы вроде 'На картинке изображено', 'Я вижу', 'Здесь показано'. Отвечай естественно.]"
-            )
-        else:
-            text += "\n\n[СИСТЕМНОЕ УВЕДОМЛЕНИЕ: К этому запросу прикреплено ИЗОБРАЖЕНИЕ. Обязательно проанализируй его!]"
-
-    # Финальная защита: если нет ни текста (включая извлеченный из файлов/голоса), ни картинки - выходим
-    if not text and not image_bytes:
-        return
-
     try:
         is_short = prepared_reply is not None
-        if chat_type == "private":
-            prompt_text = text
-        else:
-            prompt_text = f"{user_name} (ID: {user_id}) пишет: {text}"
-
         if is_short:
-            # Ответ уже проверен и подготовлен; не просим другую модель отвечать заново.
-            reply = html.escape(prepared_reply)
+            prompt_text = text if chat_type == "private" else f"{user_name} (ID: {user_id}) пишет: {text}"
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{trigger_msg.message_id}"),
                 InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{trigger_msg.message_id}:{user_id}")
             ]])
-            await trigger_msg.reply_text(reply, parse_mode='HTML', reply_markup=keyboard,
-                                         disable_notification=is_silent)
+            await rich_utils.send_rich_safe(
+                context.bot, chat_id, prepared_reply,
+                reply_to_message_id=trigger_msg.message_id,
+                reply_markup=keyboard,
+                disable_notification=is_silent
+            )
             await database.add_message_to_db(history_key, "user", prompt_text)
             await database.add_message_to_db(history_key, "assistant", prepared_reply)
             return
 
         user_lock = await ensure_user_lock(history_key)
-
-        # 🛑 ЗАЩИТА: Если мы уже генерируем ответ этому юзеру/чату - просим подождать
         if user_lock.locked():
             await update.message.reply_text("⏳ Я еще думаю над прошлым вопросом, подождите немного...")
             return
 
-        async with user_lock:
-            cancel_kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🛑 Отмена", callback_data=f"cancel:{history_key}")]])
-            wait_msg = await update.message.reply_text("⏳ Ждём ответ...", reply_markup=cancel_kb, disable_notification=True)
+        cancel_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🛑 Отмена", callback_data=f"cancel:{history_key}")]]
+        )
+        tracker = rich_utils.RichStatusTracker(
+            context.bot, chat_id, chat_type,
+            reply_to_message_id=trigger_msg.message_id,
+            cancel_kb=cancel_kb
+        )
 
+        video_grid_bytes = None
+        image_bytes = None
+
+        async with user_lock:
             stop_event = asyncio.Event()
             typing_task = asyncio.create_task(typing_sender(chat_id, context, stop_event))
 
-            # === МАГИЯ WEB-ПАРСЕРА ===
-            # Прогоняем текст через парсер ссылок перед отправкой в ИИ
-            enriched_prompt, parsed_image_bytes = await web_parser.process_message_for_urls(prompt_text)
-
-            # Если есть фото, раскадровка видео/GIF или картинка по ссылке — передаем в Vision-модель
-            final_image_bytes = image_bytes or video_grid_bytes or parsed_image_bytes
-
-            # Передаем обогащенный промпт (с текстом сайтов) и картинку в LLM
-            gen_task = asyncio.create_task(
-                ai_core.ask_llm(history_key, enriched_prompt, chat_type, user_name, final_image_bytes))
-            config.active_tasks[history_key] = gen_task
-
             try:
-                reply = await gen_task
-            except asyncio.CancelledError:
-                # Если задачу принудительно отменили кнопкой
+                # 1. ГОЛОСОВЫЕ И АУДИО
+                if media_msg.voice or media_msg.audio:
+                    audio_obj = media_msg.voice if media_msg.voice else media_msg.audio
+                    if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
+                        await update.message.reply_text("⚠️ Аудио слишком большое (лимит 20 МБ).")
+                        return
+                    await tracker.step("🎧 Слушаю и расшифровываю голосовое сообщение...", force=True)
+                    file = await audio_obj.get_file()
+                    audio_bytes = bytes(await file.download_as_bytearray())
+                    mime_type = getattr(audio_obj, 'mime_type', None) or 'audio/ogg'
+                    try:
+                        transcript = await ai_core.transcribe_audio(audio_bytes, mime_type=mime_type)
+                        text = (text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript}").strip()
+                    except Exception as e:
+                        logger.error(f"Ошибка каскада распознавания аудио: {e}")
+                        await tracker.cleanup()
+                        await update.message.reply_text("⚠️ Ошибка распознавания голоса (все аудио-сервисы временно недоступны).")
+                        return
+
+                # 2. ВИДЕОФАЙЛЫ, КРУЖКИ И GIF
+                elif media_msg.video or media_msg.video_note or media_msg.animation:
+                    vid_obj = media_msg.video or media_msg.video_note or media_msg.animation
+                    is_gif = bool(media_msg.animation)
+                    if vid_obj.file_size and vid_obj.file_size > 20 * 1024 * 1024:
+                        await update.message.reply_text("⚠️ Видео/GIF слишком большое (лимит Telegram Bot API — 20 МБ).")
+                        return
+                    await tracker.step(
+                        "🎬 Анализирую кадры и текст на GIF..." if is_gif else "🎬 Слушаю звук и смотрю субтитры на видео...",
+                        force=True
+                    )
+                    try:
+                        file = await vid_obj.get_file()
+                        video_bytes = bytes(await file.download_as_bytearray())
+                        transcript, video_grid_bytes = await web_parser.extract_video_file_context(video_bytes, is_gif=is_gif)
+                        media_label = "GIF-анимацию" if is_gif else "видеофайл"
+                        if transcript:
+                            text = (text + f"\n\n[Пользователь отправил {media_label}. Распознанная речь из видео]:\n{transcript}").strip()
+                        else:
+                            text = (text + f"\n\n[Пользователь отправил {media_label} без устной речи (или только с музыкой/текстом на экране). "
+                                           f"Проанализируй прикрепленную раскадровку (4 кадра из видео), прочитай вшитые субтитры/надписи и ответь по сути.]").strip()
+                    except Exception as e:
+                        logger.error(f"Ошибка анализа видео/GIF: {e}")
+                        await tracker.cleanup()
+                        await update.message.reply_text("⚠️ Не удалось обработать видеофайл.")
+                        return
+
+                # 3. ПРИКРЕПЛЕННЫЕ ДОКУМЕНТЫ
+                elif media_msg.document:
+                    doc = media_msg.document
+                    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+                        await update.message.reply_text("⚠️ Файл слишком большой (лимит Telegram Bot API — 20 МБ).")
+                        return
+
+                    mime = (doc.mime_type or "").lower()
+                    fname_lower = (doc.file_name or "").lower()
+                    is_video_doc = mime.startswith("video/") or fname_lower.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi"))
+                    is_gif_doc = mime == "image/gif" or fname_lower.endswith(".gif")
+
+                    if is_video_doc or is_gif_doc:
+                        await tracker.step(f"🎬 Анализирую медиа-документ {doc.file_name}...", force=True)
+                        try:
+                            file = await doc.get_file()
+                            file_bytes = bytes(await file.download_as_bytearray())
+                            transcript, video_grid_bytes = await web_parser.extract_video_file_context(
+                                file_bytes, is_gif=is_gif_doc
+                            )
+                            if transcript:
+                                text = (text + f"\n\n[Пользователь отправил видео-документ {doc.file_name}. Распознанная речь]:\n{transcript}").strip()
+                            else:
+                                text = (text + f"\n\n[Пользователь отправил медиа-документ {doc.file_name} без устной речи. "
+                                               f"Проанализируй прикрепленную раскадровку (4 кадра), прочитай субтитры/надписи и ответь по сути.]").strip()
+                        except Exception as e:
+                            logger.error(f"Ошибка анализа видео-документа: {e}")
+                            await tracker.cleanup()
+                            await update.message.reply_text("⚠️ Ошибка при обработке видео-документа.")
+                            return
+                    else:
+                        await tracker.step(f"📄 Читаю файл {doc.file_name}...", force=True)
+                        try:
+                            file = await doc.get_file()
+                            file_bytes = bytes(await file.download_as_bytearray())
+
+                            if mime == 'application/pdf' or fname_lower.endswith('.pdf'):
+                                pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
+                                doc_text = "".join([page.get_text() for page in pdf])
+                                text += f"\n\n[Содержимое прикрепленного PDF файла {doc.file_name}]:\n{doc_text[:6000]}..."
+                            elif fname_lower.endswith('.docx'):
+                                docx_file = io.BytesIO(file_bytes)
+                                document = Document(docx_file)
+                                doc_text = "\n".join([para.text for para in document.paragraphs])
+                                text += f"\n\n[Содержимое прикрепленного Word документа {doc.file_name}]:\n{doc_text[:6000]}..."
+                            else:
+                                try:
+                                    doc_text = file_bytes.decode('utf-8')
+                                    text += f"\n\n[Содержимое прикрепленного файла {doc.file_name}]:\n{doc_text[:6000]}..."
+                                except UnicodeDecodeError:
+                                    text += f"\n\n[Системное сообщение: Пользователь прикрепил файл {doc.file_name}, но это неизвестный бинарный формат. Бот не смог извлечь из него текст. Сообщи об этом пользователю.]"
+                        except Exception as e:
+                            logger.error(f"Ошибка чтения файла: {e}")
+                            await tracker.cleanup()
+                            await update.message.reply_text("⚠️ Ошибка при чтении файла.")
+                            return
+
+                # 4. ФОТО
+                if media_msg.photo:
+                    await tracker.step("🖼 Загружаю и анализирую изображение...", force=True)
+                    photo_file = await media_msg.photo[-1].get_file()
+                    image_bytes = bytes(await photo_file.download_as_bytearray())
+                    if not text:
+                        text = (
+                            "[Системная пометка: Пользователь отправил картинку без текста. "
+                            "Изучи её и отреагируй как живой участник чата. Обязательно учитывай наш предыдущий контекст диалога. "
+                            "Если это мем или шутка — посмейся или ответь встречной шуткой. "
+                            "Если текст или интерфейс на иностранном языке — помоги перевести или объясни суть. "
+                            "Если это просто фото — прокомментируй его по-человечески. "
+                            "СТРОГО ЗАПРЕЩЕНО использовать фразы вроде 'На картинке изображено', 'Я вижу', 'Здесь показано'. Отвечай естественно.]"
+                        )
+                    else:
+                        text += "\n\n[СИСТЕМНОЕ УВЕДОМЛЕНИЕ: К этому запросу прикреплено ИЗОБРАЖЕНИЕ. Обязательно проанализируй его!]"
+
+                if not text and not image_bytes and not video_grid_bytes:
+                    await tracker.cleanup()
+                    return
+
+                prompt_text = text if chat_type == "private" else f"{user_name} (ID: {user_id}) пишет: {text}"
+
+                # 5. ПАРСИНГ ССЫЛОК (WEB / YOUTUBE / INSTAGRAM / TIKTOK)
+                if web_parser.extract_urls(prompt_text):
+                    await tracker.step("🌐 Загружаю данные и субтитры по ссылке...", force=True)
+                enriched_prompt, parsed_image_bytes = await web_parser.process_message_for_urls(prompt_text)
+                final_image_bytes = image_bytes or video_grid_bytes or parsed_image_bytes
+
+                # 6. ЗАПРОС К LLM С ОБНОВЛЕНИЕМ <tg-thinking>
+                gen_task = asyncio.create_task(
+                    ai_core.ask_llm(
+                        history_key, enriched_prompt, chat_type, user_name,
+                        final_image_bytes, status_callback=tracker.step
+                    )
+                )
+                config.active_tasks[history_key] = gen_task
+
+                try:
+                    reply = await gen_task
+                except asyncio.CancelledError:
+                    return
+                finally:
+                    config.active_tasks.pop(history_key, None)
+
+            finally:
                 stop_event.set()
                 typing_task.cancel()
-                return
-            finally:
-                config.active_tasks.pop(history_key, None)
-
-        stop_event.set()
-        typing_task.cancel()
-
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
+                await tracker.cleanup()
 
         # ПАРСИНГ РЕАКЦИИ ОТ ИИ
-        match = re.search(r'\[REACTION:\s*(.*?)\]', reply)
+        match = re.search(r'\[REACTION:\s*(.*?)\]', reply or "")
         if match:
             reaction_emoji = match.group(1).strip()
             reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply).strip()
 
             if reaction_emoji in ai_core.ALLOWED_REACTIONS:
                 try:
-                    await message.set_reaction(reaction=[ReactionTypeEmoji(reaction_emoji)])
+                    await trigger_msg.set_reaction(reaction=[ReactionTypeEmoji(reaction_emoji)])
                 except Exception as e:
                     logger.warning(f"Не удалось поставить реакцию {reaction_emoji}: {e}")
             else:
@@ -676,24 +634,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not reply:
             return
 
-        if is_short:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔇 Тише", callback_data=f"silence:{chat_id}:{message.message_id}"),
-                InlineKeyboardButton("📖 Подробнее", callback_data=f"more:{message.message_id}:{user_id}")
-            ]])
-            await update.message.reply_text(reply, parse_mode='HTML', reply_markup=keyboard,
-                                            disable_notification=is_silent)
-        else:
-            for part in split_message(reply):
-                await update.message.reply_text(part, parse_mode='HTML', disable_notification=is_silent)
+        await rich_utils.send_rich_safe(
+            context.bot,
+            chat_id=chat_id,
+            text=reply,
+            reply_to_message_id=trigger_msg.message_id,
+            disable_notification=is_silent,
+        )
 
-    except Exception as e:
+    except Exception:
         logger.exception("Ошибка в handle_message")
 
 
 async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # Обязательно! Убирает анимацию загрузки на кнопке
+    await query.answer()
 
     try:
         _, target_key = query.data.split(":")
@@ -703,8 +658,19 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("🛑 Генерация отменена пользователем.")
         else:
             await query.edit_message_text("🛑 Запрос уже завершен или отменен.")
-    except Exception as e:
+    except Exception:
         logger.exception("Ошибка в кнопке Отмена")
+
+
+async def handle_generation_stopped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия нативной кнопки '⏹ Остановить' в sendRichMessageDraft (Bot API 10.3)"""
+    msg = update.effective_message
+    if not msg:
+        return
+    history_key = msg.from_user.id if msg.chat.type == "private" else msg.chat_id
+    if history_key in config.active_tasks:
+        config.active_tasks[history_key].cancel()
+        await msg.reply_text("🛑 Генерация ответа остановлена.")
 
 
 async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -716,33 +682,41 @@ async def expand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat_id
         history_key = int(user_id_str) if query.message.chat.type == 'private' else chat_id
 
-        # 1. Захватываем текст короткого ответа прямо из сообщения с кнопкой
-        bot_short_answer = query.message.text or ""
+        # Извлекаем текст короткого ответа (работает и для RichMessage, и для обычного текста)
+        bot_short_answer = rich_utils.extract_any_message_text(query.message)
+        if not bot_short_answer:
+            hist = await database.get_history_from_db(history_key, limit=2)
+            for m in reversed(hist):
+                if m["role"] == "assistant":
+                    bot_short_answer = m["content"]
+                    break
 
         await query.edit_message_reply_markup(reply_markup=None)
-        wait_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏳ Собираю подробный ответ...",
-            reply_to_message_id=original_msg_id,
-            disable_notification=True
+        tracker = rich_utils.RichStatusTracker(
+            context.bot, chat_id, query.message.chat.type, reply_to_message_id=original_msg_id
         )
+        await tracker.step("📖 Собираю развернутый ответ...", force=True)
 
-        # 2. Явно передаем этот текст нейросети, чтобы она знала, о чем речь
         prompt = (
             "Пожалуйста, распиши вот этот свой краткий ответ максимально подробно "
             f"и развернуто. Дай больше деталей:\n\n«{bot_short_answer}»"
         )
 
-        reply = await ai_core.ask_llm(history_key, prompt, query.message.chat.type)
-
+        reply = await ai_core.ask_llm(
+            history_key, prompt, query.message.chat.type, status_callback=tracker.step
+        )
         is_silent = await database.get_silent_responses(history_key)
+        await tracker.cleanup()
 
-        await wait_msg.delete()
-        for part in split_message(reply):
-            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode='HTML',
-                                           disable_notification=is_silent)
+        await rich_utils.send_rich_safe(
+            context.bot,
+            chat_id=chat_id,
+            text=reply,
+            reply_to_message_id=original_msg_id,
+            disable_notification=is_silent,
+        )
 
-    except Exception as e:
+    except Exception:
         logger.exception("Ошибка при обработке кнопки подробнее")
         await context.bot.send_message(chat_id=query.message.chat.id, text="⚠ Ошибка при формировании ответа.")
 
@@ -763,33 +737,30 @@ async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "silence":
             # 1. Устанавливаем тишину, используя константу SILENCE_MINUTES
             config.silenced_chats[chat_id] = datetime.now(timezone.utc) + timedelta(minutes=config.SILENCE_MINUTES)
-
             # 2. Меняем кнопку на информативную с крестиком отмены
             for row in existing_markup.inline_keyboard:
                 new_row = []
                 for btn in row:
                     if btn.callback_data and btn.callback_data.startswith("silence:"):
                         new_text = f"🔊 Молчу {config.SILENCE_MINUTES} мин. (❌)"
-                        new_row.append(InlineKeyboardButton(new_text,
-                                                            callback_data=btn.callback_data.replace("silence:",
-                                                                                                    "unsilence:")))
+                        new_row.append(InlineKeyboardButton(
+                            new_text, callback_data=btn.callback_data.replace("silence:", "unsilence:")
+                        ))
                     else:
                         new_row.append(btn)
                 new_inline_keyboard.append(new_row)
 
         elif action == "unsilence":
             # 1. Досрочно снимаем тишину
-            if chat_id in config.silenced_chats:
-                del config.silenced_chats[chat_id]
-
+            config.silenced_chats.pop(chat_id, None)
             # 2. Возвращаем исходную кнопку
             for row in existing_markup.inline_keyboard:
                 new_row = []
                 for btn in row:
                     if btn.callback_data and btn.callback_data.startswith("unsilence:"):
-                        new_row.append(InlineKeyboardButton("🔇 Тише",
-                                                            callback_data=btn.callback_data.replace("unsilence:",
-                                                                                                    "silence:")))
+                        new_row.append(InlineKeyboardButton(
+                            "🔇 Тише", callback_data=btn.callback_data.replace("unsilence:", "silence:")
+                        ))
                     else:
                         new_row.append(btn)
                 new_inline_keyboard.append(new_row)
@@ -803,17 +774,17 @@ async def silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     # Проверяем права на управление настройками (в ЛС всегда True, в группе - только админы)
     can_change_settings = await check_admin_rights(update, context)
 
     # 1. Базовая справка для всех
     help_text = (
         "🤖 <b>Умный ИИ-ассистент</b>\n\n"
-        "Я умею поддерживать диалог, запоминать контекст и <b>видеть картинки</b> (отправь фото с текстом или мем, и я пойму, что там изображено).\n\n"
+        "Я умею поддерживать диалог, запоминать контекст, <b>видеть картинки и видео</b>, слушать голосовые и переводить видео по ссылкам.\n\n"
         "В группах я не влезаю в каждую беседу. Я отвечаю только если меня тегнуть, ответить на мое сообщение или задать вопрос со знаком «?», на который у меня есть полезный ответ. Если данных не хватает, я молчу. А еще я умею реагировать эмодзи!\n\n"
         "<b>Команды:</b>\n"
         "🔹 /model — выбрать нейросеть (Gemini, Groq, OpenRouter)\n"
+        "🔹 /events — дни рождения и особые даты чата\n"
         "🔹 /reset — начать диалог с чистого листа (сбросить память)\n"
         "🔹 /pay — оформить или продлить подписку\n"
         "🔹 /help — показать эту справку"
@@ -823,7 +794,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if can_change_settings:
         help_text += (
             "\n\n⚙️ <b>Настройки чата:</b>\n"
-            "🔹 /setting — управление режимами ИИ и памятью"
+            "🔹 /setting — управление режимами ИИ, памятью и праздниками"
         )
 
     # 3. Секретный блок ВЛАДЕЛЬЦА (видишь только ТЫ)
@@ -838,17 +809,13 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name
-
     welcome_text = (
         f"Привет, <b>{user_name}</b>! 👋\n\n"
-        "Я — твой умный ИИ-помощник. Я умею поддерживать диалог, запоминать контекст нашей беседы и <b>видеть картинки</b> (просто скинь мне фото или мем!).\n\n"
+        "Я — твой умный ИИ-помощник. Я умею поддерживать диалог, запоминать контекст нашей беседы и <b>видеть картинки и видео</b> (просто скинь мне фото, видео или мем!).\n\n"
         "Напиши свой первый вопрос или отправь /help, чтобы посмотреть список команд."
     )
-
-    # Добавляем инлайн-кнопку, чтобы сразу вовлечь пользователя
-    keyboard = [[InlineKeyboardButton("⚙️ Выбрать нейросеть", callback_data="setting:models_placeholder")]]
-
     await update.message.reply_text(welcome_text, parse_mode='HTML')
+
 
 async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
@@ -858,19 +825,15 @@ async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_models = database.load_models_config()
-
     # Оставляем только те модели, которые предназначены для выбора юзером (текстовые флагманы)
     selectable_models = [m for m in all_models if m.get("selectable", True)]
-
     # Задаем количество столбцов (2)
     COLUMNS = 2
-
     # Создаем плоский список всех кнопок
     buttons = [
         InlineKeyboardButton(m["name"], callback_data=f"set_model:{m['id']}")
         for m in selectable_models
     ]
-
     # Разбиваем список на строки по COLUMNS кнопок в каждой
     keyboard = [buttons[i:i + COLUMNS] for i in range(0, len(buttons), COLUMNS)]
 
@@ -878,6 +841,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Выберите активную нейросеть:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
 
 async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -897,6 +861,7 @@ async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not keep_context and current_model_id != model_id:
         await database.clear_history_in_db(key)
         context_msg = "\n🧼 <i>(Контекст прошлого диалога удален)</i>"
+
     # Ищем полную информацию о выбранной модели в конфиге
     all_models = database.load_models_config()
     selected_model = next((m for m in all_models if m["id"] == model_id), None)
@@ -916,7 +881,6 @@ async def set_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
     # 1. Достаем последние 6 сообщений из базы для контекста
     history = await database.get_history_from_db(chat_id, limit=6)
     history_text = "\n".join([f"{msg['role']}: {msg['content'][:100]}" for msg in history])
@@ -929,7 +893,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if member.id == context.bot.id:
             continue
 
-        # 2. Формируем промпт без конфликтующих заголовков
         prompt = (
             f"[Системное событие: в группу вступил новый участник {member.full_name}].\n"
             "Напиши для него короткое, креативное и теплое приветствие на 1-2 предложения (можно со смайликами в тексте). "
@@ -956,7 +919,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if match:
             reaction_emoji = match.group(1).strip()
             reply = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply).strip()
-
             # Ставим реакцию ТОЛЬКО если эмодзи реально существует в белом списке Telegram
             if reaction_emoji in ai_core.ALLOWED_REACTIONS:
                 try:
@@ -965,19 +927,22 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     logger.warning(f"Не удалось поставить реакцию {reaction_emoji}: {e}")
 
         if reply:
-            await update.message.reply_text(reply, parse_mode='HTML', disable_notification=is_silent)
+            await rich_utils.send_rich_safe(
+                context.bot, chat_id, reply,
+                reply_to_message_id=update.message.message_id,
+                disable_notification=is_silent
+            )
+
 
 # ==========================================
 # УПРАВЛЕНИЕ ПРАЗДНИКАМИ И ДР (/events)
 # ==========================================
 
 async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список ДР/событий чата и позволяет добавлять или удалять их"""
     chat_key = update.effective_user.id if update.effective_chat.type == 'private' else update.effective_chat.id
 
     # --- БЫСТРЫЙ ТЕСТ РАССЫЛОК ДЛЯ АДМИНА ---
-    if context.args and len(context.args) == 1 and context.args[0].lower() in ("test_mon", "test_fri", "test_day",
-                                                                               "test_bday"):
+    if context.args and len(context.args) == 1 and context.args[0].lower() in ("test_mon", "test_fri", "test_day", "test_bday"):
         if not await check_admin_rights(update, context):
             return
         import tasks
@@ -992,7 +957,7 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent = await tasks.check_and_send_upcoming_bday_alerts(context, target_chat_id=chat_key)
                 res = (
                     f"✅ Проверка ДР (на 1–3 дня вперед) завершена!\n"
-                    f"Отправлено уведомлений админам в ЛС: <b>{sent}</b> шт."
+                    f"Отправлено уведомлений админам в ЛС: **{sent}** шт."
                 )
             elif cmd == "test_mon":
                 res = await holidays.build_monday_digest(chat_key, start_dt=now)
@@ -1007,7 +972,11 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # При тесте дня заодно проверяем отправку ДР в личку админам!
                 await tasks.check_and_send_upcoming_bday_alerts(context, target_chat_id=chat_key)
             await wait_msg.delete()
-            await update.message.reply_text(res, parse_mode='HTML', disable_notification=is_silent)
+            await rich_utils.send_rich_safe(
+                context.bot, update.effective_chat.id, res,
+                reply_to_message_id=update.message.message_id,
+                disable_notification=is_silent
+            )
         except Exception as e:
             await wait_msg.edit_text(f"⚠️ Ошибка теста: {e}")
         return
@@ -1079,6 +1048,7 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb) if kb else None
     )
 
+
 async def delete_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_admin_rights(update, context):
@@ -1100,6 +1070,7 @@ async def delete_event_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )])
 
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
 
 async def mute_bday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет админу отключить или включить личные уведомления о ДР из конкретной группы"""

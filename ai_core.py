@@ -29,6 +29,7 @@ ALLOWED_REACTIONS = {
     "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂️", "🤷", "🤷‍♀️", "😡"
 }
 
+
 def get_system_prompt(chat_type, user_name=""):
     if chat_type == "private":
         base_prompt = config.AI_PROMPT_PM or ""
@@ -45,16 +46,26 @@ def get_system_prompt(chat_type, user_name=""):
         "В самом тексте ответа можно использовать любые смайлики, но в теге [REACTION: ...] — строго из списка! "
         "Если подходящей реакции в списке нет — просто пиши текст без тега [REACTION].]"
     )
-    return base_prompt + reaction_rule
+    rich_rule = getattr(config, "AI_PROMPT_RICH_FORMAT", "")
+    return base_prompt + rich_rule + reaction_rule
 
 
-def sanitize_text(text: str) -> str:
-    """Вырезает теги <think> от DeepSeek и очищает текст от невалидного HTML"""
+def sanitize_text(text: str, strip_think: bool = True) -> str:
+    """Вырезает теги <think> (если strip_think=True) или оставляет их для конвертации в <details>."""
     if not text:
         return ""
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    text = text.replace('<think>', '').replace('</think>', '')
+    if strip_think:
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        text = text.replace('<think>', '').replace('</think>', '')
     return text.strip()
+
+
+def extract_think_content(text: str) -> str:
+    """Извлекает текст внутри <think>...</think>, если модель вернула блок размышлений."""
+    if not text:
+        return ""
+    matches = re.findall(r'<think>(.*?)</think>', text, flags=re.DOTALL)
+    return "\n".join(m.strip() for m in matches if m.strip())
 
 
 # ==========================================
@@ -75,7 +86,7 @@ async def query_gemini(model_id: str, history: list, sys_prompt: str, image_byte
     conf = types.GenerateContentConfig(system_instruction=sys_prompt if sys_prompt else None, temperature=0.7)
     response = await asyncio.wait_for(
         asyncio.to_thread(gemini_client.models.generate_content, model=model_id, contents=contents, config=conf),
-        timeout=15.0
+        timeout=20.0
     )
     return (response.text or "").strip()
 
@@ -101,9 +112,9 @@ async def query_groq(model_id: str, history: list, sys_prompt: str, image_bytes:
             model=model_id,
             messages=messages,
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=2048
         ),
-        timeout=15.0
+        timeout=20.0
     )
     return response.choices[0].message.content.strip()
 
@@ -130,7 +141,7 @@ async def query_openrouter(model_id: str, history: list, sys_prompt: str, image_
             messages=messages,
             temperature=0.7,
         ),
-        timeout=15.0,
+        timeout=20.0,
     )
     return response.choices[0].message.content.strip()
 
@@ -159,9 +170,6 @@ def parse_llm_error(error: Exception) -> str:
 # ==========================================
 
 def get_capable_models(required_capability: str, current_model_id: str):
-    """Возвращает список моделей, обладающих нужным навыком (text, image, audio).
-       Сначала подставляет текущую модель (если она умеет), затем все остальные подходящие.
-    """
     all_models = database.load_models_config()
     capable_models = [m for m in all_models if required_capability in m.get("capabilities", [])]
 
@@ -178,36 +186,37 @@ def get_capable_models(required_capability: str, current_model_id: str):
     return ordered
 
 
-async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str = "", image_bytes: bytes = None, save_to_history: bool = True):
-    # Сохраняем запрос в БД только если это реальное сообщение пользователя, а не системная команда
+async def ask_llm(
+    user_or_chat_id,
+    prompt: str,
+    chat_type: str,
+    user_name: str = "",
+    image_bytes: bytes = None,
+    save_to_history: bool = True,
+    status_callback=None,
+):
     if save_to_history:
         db_prompt = f"[Фото] {prompt}" if image_bytes else prompt
         await database.add_message_to_db(user_or_chat_id, "user", db_prompt)
 
     history = await database.get_history_from_db(user_or_chat_id, limit=12)
-    # Если мы не сохраняли системный промпт в БД, добавляем его временно в конец истории для генерации
     if not save_to_history:
         history.append({"role": "user", "content": prompt})
 
     sys_prompt = get_system_prompt(chat_type, user_name)
-
     current_model_id = await database.get_user_model(user_or_chat_id)
 
-    # 1. Анализируем контент и определяем, какой навык нужен
     required_capability = "text"
     if image_bytes:
         required_capability = "image"
     elif "[Аудио]:" in prompt:
         required_capability = "audio"
 
-    # 2. Получаем только те модели, которые физически способны обработать этот контент
     ordered_models = get_capable_models(required_capability, current_model_id)
 
     if not ordered_models:
         return f"⚠️ В списке доступных нейросетей нет ни одной модели, способной обработать этот тип данных (нужен навык: {required_capability})."
 
-    # 3. Если автопереключение выключено, мы можем использовать только ПЕРВУЮ модель из подходящих.
-    # Если юзер выбрал текстовую модель, а прислал картинку, первая подходящая модель будет ВРЕМЕННОЙ.
     auto_fallback = await database.get_auto_fallback(user_or_chat_id)
     if not auto_fallback:
         ordered_models = [ordered_models[0]]
@@ -217,42 +226,58 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
     switch_reason = ""
 
     async with config.GLOBAL_SEMAPHORE:
-        for model in ordered_models:
+        for idx, model in enumerate(ordered_models):
             model_id = model["id"]
             provider = model["provider"]
 
+            if status_callback:
+                try:
+                    if idx == 0:
+                        await status_callback(f"🧠 Генерирую ответ через {model['name']}...")
+                    else:
+                        await status_callback(f"⚡ Переключаюсь на {model['name']} ({switch_reason})...")
+                except Exception:
+                    pass
+
             try:
                 if provider == "gemini":
-                    reply_text = await query_gemini(model_id, history, sys_prompt, image_bytes)
+                    raw_reply = await query_gemini(model_id, history, sys_prompt, image_bytes)
                 elif provider == "groq":
-                    reply_text = await query_groq(model_id, history, sys_prompt, image_bytes)
+                    raw_reply = await query_groq(model_id, history, sys_prompt, image_bytes)
                 elif provider == "openrouter":
-                    reply_text = await query_openrouter(model_id, history, sys_prompt, image_bytes)
+                    raw_reply = await query_openrouter(model_id, history, sys_prompt, image_bytes)
                 else:
                     continue
 
-                reply_text = sanitize_text(reply_text)
+                # Если модель выдала <think>...</think>, транслируем мысль в черновик <tg-thinking>
+                thought_text = extract_think_content(raw_reply)
+                if thought_text and status_callback:
+                    try:
+                        await status_callback("💭 Формулирую финальный ответ...", thought_preview=thought_text[:800], force=True)
+                    except Exception:
+                        pass
 
-                # Если после очистки от <think> модель вернула пустоту (или только тег реакции без текста, когда нужен ответ),
-                # считаем это сбоем модели и пробуем следующую в каскаде!
-                text_without_reaction = re.sub(r'\[REACTION:\s*.*?\]\s*', '', reply_text).strip()
-                if not reply_text or (not save_to_history and not text_without_reaction):
+                # Проверяем, что помимо мыслей и тега реакции есть реальный ответ
+                clean_check = sanitize_text(raw_reply, strip_think=True)
+                text_without_reaction = re.sub(r'\[REACTION:\s*.*?\]\s*', '', clean_check).strip()
+                if not clean_check or (not save_to_history and not text_without_reaction):
                     raise ValueError("Модель вернула пустой текст ответа")
 
-                # Записываем смену модели только если это обычный текстовый запрос
-                # (Чтобы бот не переключился на vision-модель навсегда, если юзер просто скинул одну фотку)
+                # Для системных сообщений (праздники, приветствия) убираем <think>,
+                # а для диалогов оставляем — rich_utils превратит <think> в красивый спойлер <details>
+                reply_text = clean_check if not save_to_history else raw_reply.strip()
+
                 if model_id != current_model_id and required_capability == "text":
                     switched = True
                     new_model_name = model["name"]
                     await database.set_user_model(user_or_chat_id, model_id)
                 elif model_id != current_model_id and required_capability != "text":
-                    # Для медиа-запросов мы не сохраняем модель в БД (временная маршрутизация),
-                    # но уведомляем юзера, что фото/аудио было обработано другой нейросетью.
                     switched = True
                     new_model_name = model["name"]
                     switch_reason = f"текущая модель не поддерживает {required_capability}"
 
-                await database.add_message_to_db(user_or_chat_id, "assistant", reply_text)
+                if save_to_history:
+                    await database.add_message_to_db(user_or_chat_id, "assistant", clean_check)
 
                 if switched:
                     show_tech = await database.get_show_tech_details(user_or_chat_id)
@@ -279,7 +304,7 @@ async def ask_llm(user_or_chat_id, prompt: str, chat_type: str, user_name: str =
 def parse_group_reply(raw: str):
     """Неоднозначный/невалидный результат никогда не разрешает вмешательство."""
     try:
-        result = json.loads(sanitize_text(raw))
+        result = json.loads(sanitize_text(raw, strip_think=True))
     except (ValueError, TypeError):
         return None
     if not isinstance(result, dict) or set(result) != {"action", "answer"}:
@@ -293,11 +318,6 @@ def parse_group_reply(raw: str):
 
 
 async def prepare_group_reply(text: str, chat_id: int, user_name: str = "Пользователь"):
-    """Проверяет полезность и возвращает тот же готовый ответ, без второй генерации.
-
-    Отказ не запускает каскад: запасная модель нужна только при сбое API/протокола.
-    Ничего не записывает в историю и не меняет выбранную модель.
-    """
     if len(text.strip()) < 3:
         return None
     current_model_id = await database.get_user_model(chat_id)
@@ -334,8 +354,7 @@ async def prepare_group_reply(text: str, chat_id: int, user_name: str = "Пол�
                     raw = response.choices[0].message.content
                 else:
                     continue
-                # Строгое чтение: слово «да» внутри другого слова больше не считается согласием.
-                result = json.loads(sanitize_text(raw))
+                result = json.loads(sanitize_text(raw, strip_think=True))
                 print(f"Ответ нейронки на вопрос Short: {result}")
                 if (isinstance(result, dict) and set(result) == {"action", "answer"}
                         and result["action"] == "skip" and result["answer"] == ""):
@@ -350,7 +369,6 @@ async def prepare_group_reply(text: str, chat_id: int, user_name: str = "Пол�
 
 
 async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Пользователь"):
-    """Совместимость для старых вызовов. Обработчик использует prepare_group_reply."""
     return await prepare_group_reply(text, chat_id, user_name) is not None
 
 
@@ -359,17 +377,13 @@ async def is_bot_relevant(text: str, chat_id: int, user_name: str = "Польз�
 # ==========================================
 
 async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
-    """Универсальная транскрибация аудио с авто-переключением по доступным аудио-моделям."""
     last_err = None
-
-    # 1. Загружаем все модели, у которых в capabilities есть "audio" (это и STT типа Whisper, и мультимодалки)
     all_models = database.load_models_config()
     audio_models = [m for m in all_models if "audio" in m.get("capabilities", [])]
 
     if not audio_models:
         raise RuntimeError("В списке моделей нет ни одной с поддержкой аудио (STT).")
 
-    # 2. Сортируем: сначала быстрые специализированные STT модели от Groq (Whisper), затем остальные
     whisper_models = [m for m in audio_models if "whisper" in m["id"].lower()]
     other_models = [m for m in audio_models if "whisper" not in m["id"].lower()]
     ordered_audio_models = whisper_models + other_models
@@ -379,7 +393,6 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
         model_name = item["id"]
 
         try:
-            # Сценарий STT через Groq Whisper
             if provider == "groq" and "whisper" in model_name.lower() and config.GROQ_API_KEY:
                 if "ogg" in mime_type:
                     ext = "ogg"
@@ -398,9 +411,9 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
                     timeout=20.0
                 )
                 text = transcript.strip() if isinstance(transcript, str) else getattr(transcript, "text", "").strip()
-                if text: return text
+                if text:
+                    return text
 
-            # Сценарий STT через мультимодальные модели Google Gemini
             elif provider == "gemini" and config.GEMINI_API_KEY:
                 prompt = "Сделай точную дословную расшифровку этого аудиосообщения на языке оригинала. Выведи ТОЛЬКО распознанный текст без каких-либо вводных слов, пояснений и кавычек."
                 contents = [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt]
@@ -414,9 +427,6 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
                 if (response.text or "").strip():
                     logger.info(f"Аудио успешно распознано через Gemini ({model_name}) ✅")
                     return response.text.strip()
-
-            # Сценарий STT через мультимодальные модели OpenRouter (если в будущем понадобится)
-            # elif provider == "openrouter": pass
 
         except Exception as e:
             last_err = e

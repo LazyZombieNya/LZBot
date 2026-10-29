@@ -14,6 +14,9 @@ from access import init_billing_db
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class GenerationStoppedFilter(filters.MessageFilter):
+    def filter(self, message) -> bool:
+        return bool(getattr(message, "api_kwargs", {}).get("message_generation_stopped"))
 
 async def on_startup(application):
     try:
@@ -76,6 +79,7 @@ def main():
     app.add_handler(CommandHandler("events", handlers.events_command))
     app.add_handler(CommandHandler("mute_bday", handlers.mute_bday_command))
 
+
     app.add_handler(CallbackQueryHandler(handlers.pay_callback, pattern="^paid:"))
     app.add_handler(CallbackQueryHandler(handlers.admin_confirm_callback, pattern="^admin_(confirm|reject):"))
     app.add_handler(CallbackQueryHandler(handlers.set_model_callback, pattern="^set_model:"))
@@ -86,10 +90,12 @@ def main():
     app.add_handler(CallbackQueryHandler(handlers.delete_event_callback, pattern="^del_event:"))
     app.add_handler(CallbackQueryHandler(handlers.bday_mute_callback, pattern="^bday_mute:"))
 
+
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION) & ~filters.COMMAND,
         handlers.handle_message, block=False))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handlers.welcome_new_member))
+    app.add_handler(MessageHandler(GenerationStoppedFilter(), handlers.handle_generation_stopped, block=False))
 
     app.post_init = on_startup
     logger.info("Бот с динамической загрузкой моделей и настройками запущен ✅")

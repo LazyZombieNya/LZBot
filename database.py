@@ -127,11 +127,8 @@ async def get_show_tech_details(chat_key):  return await _get_setting(chat_key, 
 
 async def toggle_show_tech_details(chat_key): return await _toggle_setting(chat_key, "show_tech_details")
 
-async def get_holidays_enabled(chat_key):   return await _get_setting(chat_key, "holidays_enabled", 0)
-
-async def toggle_holidays_enabled(chat_key): return await _toggle_setting(chat_key, "holidays_enabled")
-
 async def get_holidays_enabled(chat_key): return await get_holidays_mode(chat_key)
+
 async def toggle_holidays_enabled(chat_key): return await cycle_holidays_mode(chat_key)
 
 # ==========================================
@@ -300,3 +297,10 @@ async def set_admin_bday_mute(chat_key, user_id: int, mute: bool = True):
                 (str(chat_key), int(user_id))
             )
         await db.commit()
+
+async def get_all_chats_with_custom_events() -> list[str]:
+    """Возвращает все chat_key, у которых добавлены свои события или ДР"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute("SELECT DISTINCT chat_key FROM custom_events") as cursor:
+            rows = await cursor.fetchall()
+            return [str(r[0]) for r in rows]

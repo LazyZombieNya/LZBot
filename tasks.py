@@ -10,6 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime, timedelta
 
 import config
+import rich_utils
 from access import get_and_mark_expiring_subscriptions
 import web_parser
 import database
@@ -396,8 +397,8 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
             if mode == 2:
                 msg = await holidays.build_today_holidays_message(chat_id, dt=now)
                 if msg:
-                    await context.bot.send_message(
-                        chat_id=chat_id, text=msg, parse_mode='HTML', disable_notification=is_silent
+                    await rich_utils.send_rich_safe(
+                        context.bot, chat_id=chat_id, text=msg, disable_notification=is_silent
                     )
             elif mode == 1 and todays_events:
                 events_desc = "\n".join(
@@ -412,8 +413,8 @@ async def daily_custom_holidays_job(context: ContextTypes.DEFAULT_TYPE):
                 reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
                 reply = holidays.md_to_html(reply)
                 if reply:
-                    await context.bot.send_message(
-                        chat_id=chat_id, text=reply, parse_mode='HTML', disable_notification=is_silent
+                    await rich_utils.send_rich_safe(
+                        context.bot, chat_id=chat_id, text=reply, disable_notification=is_silent
                     )
         except Exception as e:
             logger.error(f"Ошибка утренней рассылки праздников в чате {chat_id_str}: {e}")
@@ -478,8 +479,8 @@ async def friday_upcoming_events_job(context: ContextTypes.DEFAULT_TYPE):
             is_silent = await database.get_silent_responses(chat_id)
             preview = await holidays.build_friday_preview(chat_id, friday_dt=now)
             if preview:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=preview, parse_mode='HTML', disable_notification=is_silent
+                await rich_utils.send_rich_safe(
+                    context.bot, chat_id=chat_id, text=preview, disable_notification=is_silent
                 )
         except Exception as e:
             logger.error(f"Ошибка пятничного анонса в чате {chat_id_str}: {e}")
@@ -495,8 +496,8 @@ async def monday_weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
             is_silent = await database.get_silent_responses(chat_id)
             digest = await holidays.build_monday_digest(chat_id, start_dt=now)
             if digest:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=digest, parse_mode='HTML', disable_notification=is_silent
+                await rich_utils.send_rich_safe(
+                    context.bot, chat_id=chat_id, text=digest, disable_notification=is_silent
                 )
         except Exception as e:
             logger.error(f"Ошибка еженедельного дайджеста в чате {chat_id_str}: {e}")
