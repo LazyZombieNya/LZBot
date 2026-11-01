@@ -40,6 +40,39 @@ async def check_admin_rights(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def split_message(message: str):
     return rich_utils.split_text(message, config.MAX_MESSAGE_LENGTH)
 
+async def download_telegram_media_bytes(media_obj, progress_callback=None) -> bytes:
+    """
+    Скачивает любой медиафайл из сообщения Telegram:
+    - Если файл <= 20 МБ — качает быстрым стандартным методом Bot API (get_file).
+    - Если файл > 20 МБ (или публичный Bot API вернул 'File is too big') —
+      автоматически качает его напрямую с дата-центра Telegram через MTProto / Local Bot API
+      и передает живой прогресс скачивания в progress_callback!
+    """
+    import media_processor
+
+    file_size = getattr(media_obj, "file_size", 0) or 0
+    # 1. Если размер файла известен и он сразу больше 20 МБ — идем напрямую в обход лимита Bot API
+    if file_size > 20 * 1024 * 1024:
+        direct_bytes = await media_processor.download_large_telegram_file(
+            media_obj.file_id, progress_callback=progress_callback
+        )
+        if direct_bytes:
+            return direct_bytes
+
+    # 2. Стандартный путь через Bot API (для файлов до 20 МБ)
+    try:
+        tg_file = await media_obj.get_file()
+        return bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        # 3. Если стандартный Bot API всё равно ответил "File is too big" — пробуем прямой MTProto-загрузчик
+        if "File is too big" in str(e):
+            direct_bytes = await media_processor.download_large_telegram_file(
+                media_obj.file_id, progress_callback=progress_callback
+            )
+            if direct_bytes:
+                return direct_bytes
+        raise e
+
 
 async def ensure_user_lock(key):
     if key not in config.user_locks:
@@ -460,84 +493,151 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             typing_task = asyncio.create_task(typing_sender(chat_id, context, stop_event))
 
             try:
-                # 1. ГОЛОСОВЫЕ И АУДИО
+                # 1. ГОЛОСОВЫЕ И АУДИО (С поддержкой сжатия больших аудиофайлов через ffmpeg)
                 if media_msg.voice or media_msg.audio:
                     audio_obj = media_msg.voice if media_msg.voice else media_msg.audio
-                    if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
-                        await update.message.reply_text("⚠️ Аудио слишком большое (лимит 20 МБ).")
-                        return
-                    await tracker.step("🎧 Слушаю и расшифровываю голосовое сообщение...", force=True)
-                    file = await audio_obj.get_file()
-                    audio_bytes = bytes(await file.download_as_bytearray())
-                    mime_type = getattr(audio_obj, 'mime_type', None) or 'audio/ogg'
+                    size_mb = (audio_obj.file_size or 0) / (1024 * 1024)
+
+                    if size_mb > 20:
+                        await tracker.step(
+                            f"📦 Аудиофайл большой ({size_mb:.1f} МБ) — скачиваю и сжимаю, придётся подождать чуть дольше...",
+                            force=True
+                        )
+                    else:
+                        await tracker.step("🎧 Слушаю и расшифровываю голосовое сообщение...", force=True)
+
                     try:
+                        audio_bytes = await download_telegram_media_bytes(audio_obj, progress_callback=tracker.step)
+                        mime_type = getattr(audio_obj, 'mime_type', None) or 'audio/ogg'
+
+                        # Если аудиофайл большой (> 15 МБ) — сжимаем его локально через media_processor в легкий моно-MP3
+                        if len(audio_bytes) > 15 * 1024 * 1024:
+                            await tracker.step("🗜 Сжимаю большой аудиофайл через FFmpeg для нейросети...", force=True)
+                            import tempfile, os, media_processor
+                            with tempfile.TemporaryDirectory() as tmpdir:
+                                raw_p = os.path.join(tmpdir, "big_audio")
+                                with open(raw_p, "wb") as f:
+                                    f.write(audio_bytes)
+                                comp_p = await media_processor.compress_audio_for_ai(raw_p)
+                                if comp_p and os.path.exists(comp_p):
+                                    with open(comp_p, "rb") as f:
+                                        audio_bytes = f.read()
+                                    mime_type = "audio/mpeg"
+
                         transcript = await ai_core.transcribe_audio(audio_bytes, mime_type=mime_type)
-                        text = (text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript}").strip()
+                        text = (
+                                    text + f"\n\n[Пользователь отправил голосовое сообщение. Расшифровка]:\n{transcript}").strip()
                     except Exception as e:
+                        if "File is too big" in str(e):
+                            await tracker.cleanup()
+                            await update.message.reply_text(
+                                f"⚠️ Аудиофайл весит <b>{size_mb:.1f} МБ</b>. Стандартный сервер Telegram не отдаёт ботам файлы тяжелее 20 МБ без подключенного Local Bot API Server.",
+                                parse_mode="HTML"
+                            )
+                            return
                         logger.error(f"Ошибка каскада распознавания аудио: {e}")
                         await tracker.cleanup()
-                        await update.message.reply_text("⚠️ Ошибка распознавания голоса (все аудио-сервисы временно недоступны).")
+                        await update.message.reply_text(
+                            "⚠️ Ошибка распознавания голоса (все аудио-сервисы временно недоступны).")
                         return
 
-                # 2. ВИДЕОФАЙЛЫ, КРУЖКИ И GIF
+                # 2. ВИДЕОФАЙЛЫ, КРУЖКИ И GIF (С поддержкой больших файлов и фолбэком на превью)
                 elif media_msg.video or media_msg.video_note or media_msg.animation:
                     vid_obj = media_msg.video or media_msg.video_note or media_msg.animation
                     is_gif = bool(media_msg.animation)
-                    if vid_obj.file_size and vid_obj.file_size > 20 * 1024 * 1024:
-                        await update.message.reply_text("⚠️ Видео/GIF слишком большое (лимит Telegram Bot API — 20 МБ).")
-                        return
-                    await tracker.step(
-                        "🎬 Анализирую кадры и текст на GIF..." if is_gif else "🎬 Слушаю звук и смотрю субтитры на видео...",
-                        force=True
-                    )
+                    size_mb = (vid_obj.file_size or 0) / (1024 * 1024)
+
+                    if size_mb > 20:
+                        await tracker.step(
+                            f"📦 Видео большое ({size_mb:.1f} МБ) — пробую скачать и сжать локально, подождите...",
+                            force=True
+                        )
+                    else:
+                        await tracker.step(
+                            "🎬 Анализирую кадры и текст на GIF..." if is_gif else "🎬 Слушаю звук и смотрю субтитры на видео...",
+                            force=True
+                        )
+
                     try:
-                        file = await vid_obj.get_file()
-                        video_bytes = bytes(await file.download_as_bytearray())
-                        transcript, video_grid_bytes = await web_parser.extract_video_file_context(video_bytes, is_gif=is_gif)
+                        video_bytes = await download_telegram_media_bytes(vid_obj, progress_callback=tracker.step)
+                        transcript, video_grid_bytes = await web_parser.extract_video_file_context(video_bytes,
+                                                                                                   is_gif=is_gif)
                         media_label = "GIF-анимацию" if is_gif else "видеофайл"
                         if transcript:
-                            text = (text + f"\n\n[Пользователь отправил {media_label}. Распознанная речь из видео]:\n{transcript}").strip()
+                            text = (
+                                        text + f"\n\n[Пользователь отправил {media_label}. Распознанная речь из видео]:\n{transcript}").strip()
                         else:
-                            text = (text + f"\n\n[Пользователь отправил {media_label} без устной речи (или только с музыкой/текстом на экране). "
-                                           f"Проанализируй прикрепленную раскадровку (4 кадра из видео), прочитай вшитые субтитры/надписи и ответь по сути.]").strip()
+                            text = (
+                                        text + f"\n\n[Пользователь отправил {media_label} без устной речи (или только с музыкой/текстом на экране). "
+                                               f"Проанализируй прикрепленную раскадровку (4 кадра из видео), прочитай вшитые субтитры/надписи и ответь по сути.]").strip()
                     except Exception as e:
-                        logger.error(f"Ошибка анализа видео/GIF: {e}")
-                        await tracker.cleanup()
-                        await update.message.reply_text("⚠️ Не удалось обработать видеофайл.")
-                        return
+                        # Если стандартный Bot API заблокировал скачивание (> 20 МБ), достаем встроенный кадр-превью (thumbnail)!
+                        thumb = getattr(vid_obj, "thumbnail", None)
+                        if "File is too big" in str(e) and thumb:
+                            await tracker.step(
+                                f"⚠️ Видео ({size_mb:.1f} МБ) превышает лимит облака ТГ 20 МБ — извлекаю кадр превью...",
+                                force=True
+                            )
+                            t_file = await thumb.get_file()
+                            video_grid_bytes = bytes(await t_file.download_as_bytearray())
+                            text = (
+                                        text + f"\n\n[Системная пометка: Пользователь отправил большое видео ({size_mb:.1f} МБ). "
+                                               f"Из-за лимита стандартного Telegram API в 20 МБ звук скачать не удалось, но прикреплен кадр превью этого видео. Проанализируй его и подпись пользователя.]").strip()
+                        else:
+                            logger.error(f"Ошибка анализа видео/GIF: {e}")
+                            await tracker.cleanup()
+                            await update.message.reply_text(
+                                "⚠️ Не удалось обработать видеофайл (возможно, превышен лимит 20 МБ).")
+                            return
 
-                # 3. ПРИКРЕПЛЕННЫЕ ДОКУМЕНТЫ
+                # 3. ПРИКРЕПЛЕННЫЕ ДОКУМЕНТЫ (Видео-документы, GIF, PDF, DOCX, код)
                 elif media_msg.document:
                     doc = media_msg.document
-                    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-                        await update.message.reply_text("⚠️ Файл слишком большой (лимит Telegram Bot API — 20 МБ).")
-                        return
-
+                    size_mb = (doc.file_size or 0) / (1024 * 1024)
                     mime = (doc.mime_type or "").lower()
                     fname_lower = (doc.file_name or "").lower()
-                    is_video_doc = mime.startswith("video/") or fname_lower.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi"))
+                    is_video_doc = mime.startswith("video/") or fname_lower.endswith(
+                        (".mp4", ".mov", ".mkv", ".webm", ".avi"))
                     is_gif_doc = mime == "image/gif" or fname_lower.endswith(".gif")
 
                     if is_video_doc or is_gif_doc:
-                        await tracker.step(f"🎬 Анализирую медиа-документ {doc.file_name}...", force=True)
+                        if size_mb > 20:
+                            await tracker.step(f"📦 Медиа-документ большой ({size_mb:.1f} МБ) — скачиваю и сжимаю...",
+                                               force=True)
+                        else:
+                            await tracker.step(f"🎬 Анализирую медиа-документ {doc.file_name}...", force=True)
                         try:
-                            file = await doc.get_file()
-                            file_bytes = bytes(await file.download_as_bytearray())
+                            file_bytes = await download_telegram_media_bytes(doc, progress_callback=tracker.step)
                             transcript, video_grid_bytes = await web_parser.extract_video_file_context(
                                 file_bytes, is_gif=is_gif_doc
                             )
                             if transcript:
-                                text = (text + f"\n\n[Пользователь отправил видео-документ {doc.file_name}. Распознанная речь]:\n{transcript}").strip()
+                                text = (
+                                            text + f"\n\n[Пользователь отправил видео-документ {doc.file_name}. Распознанная речь]:\n{transcript}").strip()
                             else:
-                                text = (text + f"\n\n[Пользователь отправил медиа-документ {doc.file_name} без устной речи. "
-                                               f"Проанализируй прикрепленную раскадровку (4 кадра), прочитай субтитры/надписи и ответь по сути.]").strip()
+                                text = (
+                                            text + f"\n\n[Пользователь отправил медиа-документ {doc.file_name} без устной речи. "
+                                                   f"Проанализируй прикрепленную раскадровку (4 кадра), прочитай субтитры/надписи и ответь по сути.]").strip()
                         except Exception as e:
-                            logger.error(f"Ошибка анализа видео-документа: {e}")
-                            await tracker.cleanup()
-                            await update.message.reply_text("⚠️ Ошибка при обработке видео-документа.")
-                            return
+                            thumb = getattr(doc, "thumbnail", None)
+                            if "File is too big" in str(e) and thumb:
+                                t_file = await thumb.get_file()
+                                video_grid_bytes = bytes(await t_file.download_as_bytearray())
+                                text = (
+                                            text + f"\n\n[Пользователь отправил большой видео-документ {doc.file_name} ({size_mb:.1f} МБ). Прикреплен кадр превью.]").strip()
+                            else:
+                                logger.error(f"Ошибка анализа видео-документа: {e}")
+                                await tracker.cleanup()
+                                await update.message.reply_text(
+                                    "⚠️ Ошибка при обработке видео-документа (лимит Telegram Bot API — 20 МБ).")
+                                return
                     else:
-                        await tracker.step(f"📄 Читаю файл {doc.file_name}...", force=True)
+                        if size_mb > 20:
+                            await tracker.step(
+                                f"📦 Документ {doc.file_name} большой ({size_mb:.1f} МБ) — пробую загрузить...",
+                                force=True)
+                        else:
+                            await tracker.step(f"📄 Читаю файл {doc.file_name}...", force=True)
                         try:
                             file = await doc.get_file()
                             file_bytes = bytes(await file.download_as_bytearray())
@@ -560,7 +660,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception as e:
                             logger.error(f"Ошибка чтения файла: {e}")
                             await tracker.cleanup()
-                            await update.message.reply_text("⚠️ Ошибка при чтении файла.")
+                            await update.message.reply_text(
+                                "⚠️ Ошибка при чтении файла (возможно, он превышает лимит Telegram 20 МБ).")
                             return
 
                 # 4. ФОТО

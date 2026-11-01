@@ -23,6 +23,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     logger.critical("ВНИМАНИЕ: TELEGRAM_TOKEN не найден в .env! Бот не сможет запуститься.")
 
+# Ключи MTProto (с сайта my.telegram.org) для прямого скачивания больших файлов (> 20 МБ до 2 ГБ)
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+
 # Ключи для доступа к провайдерам нейросетей
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")

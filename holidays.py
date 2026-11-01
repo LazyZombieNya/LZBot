@@ -9,29 +9,48 @@ import ai_core
 
 logger = logging.getLogger(__name__)
 
+# Названия месяцев в родительном падеже для красивого вывода дат ("31 октября")
 MONTH_NAMES_GEN = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля",
     5: "мая", 6: "июня", 7: "июля", 8: "августа",
     9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
 }
 
+# Слаг-названия месяцев для формирования URL при парсинге сайта праздников
 MONTH_URLS = {
     1: "yanvar", 2: "fevral", 3: "mart", 4: "aprel",
     5: "may", 6: "iyun", 7: "iyul", 8: "avgust",
     9: "sentyabr", 10: "oktyabr", 11: "noyabr", 12: "dekabr"
 }
 
-# Кэш производственного календаря РФ в памяти: {год: данные_json}
+# Кэш производственного календаря РФ в оперативной памяти: {год: данные_json}
+# Позволяет скачивать календарь с xmlcalendar.ru только 1 раз в год, не нагружая сеть
 _WORK_CALENDAR_CACHE: dict[int, dict] = {}
 
 
-def md_to_html(text: str) -> str:
-    """Очищает ответ от тегов реакций и конвертирует случайный Markdown (**bold**) в HTML (<b>bold</b>)"""
+def clean_holiday_reply(text: str) -> str:
+    """
+    Очищает сгенерированный нейросетью текст праздников:
+    1. Удаляет служебный тег [REACTION: ...], если модель добавила его по привычке.
+    2. Заменяет HTML-теги <b>...</b> на Markdown **...**, чтобы sendRichMessage
+       в режиме {"markdown": ...} корректно отрендерил жирный текст.
+    3. Превращает символы '• ' в начале строк в стандартные маркеры списка '- ',
+       чтобы строки гарантированно не склеивались в один абзац.
+    """
     if not text:
         return ""
+    # Убираем теги реакций
     text = re.sub(r'\[REACTION:\s*.*?\]\s*', '', text).strip()
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    return text
+    # На случай если модель по старой памяти написала <b> или <i> вместо Markdown
+    text = re.sub(r'</?b>', '**', text)
+    text = re.sub(r'</?i>', '*', text)
+    # Заменяем буллиты • в начале строк на дефисы Markdown-списка
+    text = re.sub(r'^[ \t]*•[ \t]*', '- ', text, flags=re.MULTILINE)
+    return text.strip()
+
+
+# Оставляем алиас md_to_html для обратной совместимости с вызовами в tasks.py
+md_to_html = clean_holiday_reply
 
 
 async def _get_ru_work_calendar(year: int) -> dict | None:
@@ -66,9 +85,6 @@ async def check_workday_calendar_status(dt: datetime) -> str | None:
     """
     cal = await _get_ru_work_calendar(dt.year)
     if cal:
-        # Названия официальных праздников по их ID: {"1": "Новогодние каникулы", ...}
-        holidays_map = {str(h.get("id")): h.get("title", "") for h in cal.get("holidays", [])}
-
         for m in cal.get("months", []):
             if m.get("month") == dt.month:
                 # В xmlcalendar дни записаны через запятую: "1,2,3*,4+,8*"
@@ -153,21 +169,24 @@ async def build_today_holidays_message(chat_id: int, dt: datetime = None) -> str
     web_list = await fetch_web_holidays(dt, max_items=8)
     work_status = await check_workday_calendar_status(dt)
 
+    # Собираем кастомные праздники чата в формате GFM Markdown
     custom_lines = []
     for ev in custom:
         icon = "🎂 День рождения:" if ev["category"] == "birthday" else "⭐ Особый день:"
-        custom_lines.append(f"{icon} <b>{ev['title']}</b>")
+        custom_lines.append(f"{icon} **{ev['title']}**")
 
-    fallback_text = f"📅 <b>Праздники сегодня ({date_str}):</b>\n\n"
+    # Запасной текст (на случай если все ИИ недоступны) — строго со списками '- ', чтобы ничего не слипалось
+    fallback_text = f"### 📅 Праздники сегодня ({date_str})\n\n"
     if work_status:
-        fallback_text += f"{work_status}\n\n"
+        fallback_text += f"> **{work_status}**\n\n"
     if custom_lines:
-        fallback_text += "🎉 <b>События нашего чата:</b>\n" + "\n".join(f"• {c}" for c in custom_lines) + "\n\n"
+        fallback_text += "**🎉 События нашего чата:**\n" + "\n".join(f"- {c}" for c in custom_lines) + "\n\n"
     if web_list:
-        fallback_text += "🌍 <b>Праздники в этот день:</b>\n" + "\n".join(f"• {w}" for w in web_list)
+        fallback_text += "**🌍 Праздники в этот день:**\n" + "\n".join(f"- {w}" for w in web_list)
     else:
         fallback_text += "Не удалось загрузить список праздников с внешнего календаря."
 
+    # Блок фактов для передачи в промпт нейросети
     facts_block = f"Дата: {date_str}.\n"
     if work_status:
         facts_block += f"Статус дня по производственному календарю РФ: {work_status}\n"
@@ -179,16 +198,17 @@ async def build_today_holidays_message(chat_id: int, dt: datetime = None) -> str
     prompt = (
         f"Расскажи участникам чата, какие сегодня праздники ({date_str}).\n"
         f"Вот точные данные из календаря:\n{facts_block}\n\n"
-        "Правила:\n"
-        "1. Если есть 'События нашего чата' — начни с них и тепло поздравь! Если их нет — НЕ пиши фразу 'именинников сегодня нет', сразу переходи к праздникам.\n"
-        "2. Если указан особый статус по производственному календарю (выходной, перенос или сокращенный день) — обязательно упомяни это!\n"
-        "3. Перечисли 4-5 самых интересных праздников на этот день с эмодзи.\n"
-        "4. Используй ТОЛЬКО HTML-теги <b>...</b> для жирного шрифта (ЗАПРЕЩЕНО использовать **звездочки** и [REACTION])."
+        "ЖЕСТКИЕ ПРАВИЛА ОФОРМЛЕНИЯ (Markdown):\n"
+        "1. Начни с заголовка `### 📅 Праздники на сегодня ({date_str})` и пустой строки после него.\n"
+        "2. Если есть 'События нашего чата' — выдели их в начале и тепло поздравь! Если их нет — НЕ пиши фразу 'именинников нет', сразу переходи к праздникам.\n"
+        "3. Если указан особый статус по производственному календарю (выходной, перенос или сокращенный день) — выдели его цитатой `> ...`.\n"
+        "4. КАЖДЫЙ праздник ОБЯЗАТЕЛЬНО пиши с новой строки как элемент маркированного списка (начиная строку с дефиса и пробела: `- 🎃 **Название** — краткое описание`). СТРОГО ЗАПРЕЩЕНО лепить праздники в один абзац!\n"
+        "5. Не используй HTML-теги `<b>` (используй `**жирный**`) и НЕ используй тег `[REACTION]`."
     )
 
     try:
         reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
-        clean_reply = md_to_html(reply)
+        clean_reply = clean_holiday_reply(reply)
         if clean_reply and not clean_reply.startswith("⚠️"):
             return clean_reply
     except Exception as e:
@@ -216,16 +236,16 @@ async def build_monday_digest(chat_id: int, start_dt: datetime = None) -> str | 
         cur = start_dt + timedelta(days=i)
         day_label = f"{days_ru[cur.weekday()]} ({cur.day:02d}.{cur.month:02d})"
 
-        # 1. Свои ДР и особые события чата из БД
+        # 1. Свои ДР и особые события чата из БД (форматируем как список с '- ')
         for e in all_custom:
             if e["day"] == cur.day and e["month"] == cur.month:
                 icon = "🎂 День рождения:" if e["category"] == "birthday" else "⭐ Особое событие:"
-                planned_lines.append(f"• <b>{day_label}</b> — {icon} <b>{e['title']}</b>")
+                planned_lines.append(f"- **{day_label}** — {icon} **{e['title']}**")
 
         # 2. Производственный календарь РФ (выходные среди недели, сокращенные дни, рабочие субботы)
         work_status = await check_workday_calendar_status(cur)
         if work_status:
-            work_calendar_lines.append(f"• <b>{day_label}</b> — {work_status}")
+            work_calendar_lines.append(f"- **{day_label}** — {work_status}")
 
     # Если на неделе нет ни своих событий, ни особых дней в производственном календаре — молчим
     if not planned_lines and not work_calendar_lines:
@@ -233,25 +253,25 @@ async def build_monday_digest(chat_id: int, start_dt: datetime = None) -> str | 
 
     facts = ""
     if planned_lines:
-        facts += "🎉 <b>События и Дни рождения нашего чата на этой неделе:</b>\n" + "\n".join(planned_lines) + "\n\n"
+        facts += "**🎉 События и Дни рождения нашего чата на этой неделе:**\n" + "\n".join(planned_lines) + "\n\n"
     if work_calendar_lines:
-        facts += "🗓 <b>Производственный календарь на неделю:</b>\n" + "\n".join(work_calendar_lines) + "\n\n"
+        facts += "**🗓 Производственный календарь на неделю:**\n" + "\n".join(work_calendar_lines) + "\n\n"
 
-    fallback_digest = f"📅 <b>Важные события на эту неделю:</b>\n\n{facts.strip()}"
+    fallback_digest = f"### 📅 Важные события на эту неделю\n\n{facts.strip()}"
 
     prompt = (
         "Сегодня понедельник! Напиши для чата короткий бодрый анонс важных событий на начавшуюся неделю.\n"
         f"Вот СТРОГИЙ список событий:\n{facts}\n"
-        "ЖЕСТКИЕ ПРАВИЛА:\n"
-        "1. Упоминай ТОЛЬКО те дни и события, которые переданы в списке выше!\n"
-        "2. СТРОГО ЗАПРЕЩЕНО расписывать пустые дни недели и придумывать от себя 'день продуктивности', 'экватор недели' и т.д.\n"
-        "3. Если есть официальные выходные, сокращенные дни или рабочие субботы по производственному календарю — обязательно предупреди об этом участников!\n"
-        "4. Для выделения используй HTML-теги <b>...</b> (не используй **звездочки** и не используй [REACTION])."
+        "ЖЕСТКИЕ ПРАВИЛА ОФОРМЛЕНИЯ:\n"
+        "1. Упоминай ТОЛЬКО те дни и события, которые переданы в списке выше! Запрещено расписывать пустые дни недели.\n"
+        "2. КАЖДОЕ событие и день выводи СТРОГО с новой строки через маркер списка `- **День (ДД.ММ)** — Событие`.\n"
+        "3. СТРОГО ЗАПРЕЩЕНО склеивать дни в одну строчку через `•` или запятую!\n"
+        "4. Используй Markdown `**жирный**` (без HTML-тегов `<b>` и без `[REACTION]`)."
     )
 
     try:
         reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
-        clean_reply = md_to_html(reply)
+        clean_reply = clean_holiday_reply(reply)
         if clean_reply and not clean_reply.startswith("⚠️"):
             return clean_reply
     except Exception as e:
@@ -276,19 +296,19 @@ async def build_friday_preview(chat_id: int, friday_dt: datetime = None) -> str 
         for e in all_custom:
             if e["day"] == cur.day and e["month"] == cur.month:
                 icon = "🎂 День рождения:" if e["category"] == "birthday" else "⭐ Особое событие:"
-                upcoming_items.append(f"• <b>{day_label}</b> — {icon} <b>{e['title']}</b>")
+                upcoming_items.append(f"- **{day_label}** — {icon} **{e['title']}**")
 
         work_status = await check_workday_calendar_status(cur)
         if work_status:
-            upcoming_items.append(f"• <b>{day_label}</b> — {work_status}")
+            upcoming_items.append(f"- **{day_label}** — {work_status}")
 
     if not upcoming_items:
         return None
 
     events_block = "\n".join(upcoming_items)
     fallback_text = (
-        "🍻 <b>Рабочая неделя подходит к концу!</b>\n\n"
-        "🔔 Напоминаю, какие важные даты и изменения графика ждут нас на следующей неделе:\n"
+        "### 🍻 Рабочая неделя подходит к концу!\n\n"
+        "🔔 **Напоминаю, какие важные даты и изменения графика ждут нас на следующей неделе:**\n\n"
         f"{events_block}"
     )
 
@@ -296,12 +316,16 @@ async def build_friday_preview(chat_id: int, friday_dt: datetime = None) -> str 
         "Сегодня пятница, рабочая неделя подходит к концу! "
         "Поздравь чат с пятницей в 1 предложении и перечисли СТРОГО по списку, какие события и изменения рабочего календаря "
         f"ждут нас на следующей неделе:\n{events_block}\n\n"
-        "Пиши коротко, не выдумывай лишних дней. Используй HTML-теги <b>...</b> без **звездочек** и без [REACTION]."
+        "ЖЕСТКИЕ ПРАВИЛА ОФОРМЛЕНИЯ:\n"
+        "1. После вступительного предложения обязательно сделай пустую строку.\n"
+        "2. КАЖДЫЙ пункт списка выводи СТРОГО с новой строки, начиная с дефиса: `- **День недели (ДД.ММ)** — описание`.\n"
+        "3. СТРОГО ЗАПРЕЩЕНО выводить дни в одну строку через точку `•`!\n"
+        "4. Используй Markdown `**жирный**` (не используй `<b>` и `[REACTION]`)."
     )
 
     try:
         reply = await ai_core.ask_llm(chat_id, prompt, chat_type="group", save_to_history=False)
-        clean_reply = md_to_html(reply)
+        clean_reply = clean_holiday_reply(reply)
         if clean_reply and not clean_reply.startswith("⚠️"):
             return clean_reply
     except Exception as e:

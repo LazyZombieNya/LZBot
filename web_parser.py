@@ -14,6 +14,8 @@ import logging
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+import media_processor
+
 # Критично: main.py импортирует этот модуль ДО своего собственного load_dotenv(),
 # поэтому os.getenv() ниже иначе всегда возвращал бы None для GROQ_API_KEY и т.п.
 # Подгружаем .env здесь же, на всякий случай — если уже загружен, это no-op.
@@ -83,7 +85,6 @@ else:
         "Whisper-фолбэк по аудио отключён. Положите ffmpeg.exe и ffprobe.exe в папку lib "
         "рядом со скриптом либо установите ffmpeg в PATH."
     )
-
 
 
 # --- Оповещение админа о протухших куках / антибот-блокировке YouTube ---
@@ -199,43 +200,44 @@ def extract_urls(text: str) -> list:
     return url_pattern.findall(text)
 
 
-async def transcribe_via_audio(clean_url: str, base_ydl_opts: dict) -> str | None:
+async def download_and_analyze_url_video(
+    clean_url: str, base_ydl_opts: dict, need_transcript: bool = True, need_grid: bool = True
+) -> tuple[str | None, bytes | None]:
     """
-    Скачивает минимальный по весу медиапоток через yt-dlp и распознаёт речь.
-    Работает ДАЖЕ БЕЗ установленного ffmpeg (напрямую отдает .m4a/.webm/.mp4 в Whisper или Gemini).
+    Универсальный загрузчик видео по ссылке (YouTube / Instagram / TikTok / Twitter / Reddit):
+    1. Скачивает легкий видеопоток (360p/480p mp4), чтобы мы могли и сделать коллаж 2x2 из кадров,
+       и извлечь аудиодорожку.
+    2. Если need_grid=True — делает через media_processor коллаж 2x2 (4 кадра видео),
+       чтобы ИИ видел видеоряд и мог прочитать вшитые субтитры.
+    3. Если need_transcript=True — сжимает аудио через ffmpeg (если оно большое) и распознаёт речь.
+    Возвращает кортеж: (распознанный_текст, байты_коллажа_2x2).
     """
     import ai_core
+
+    transcript = None
+    grid_bytes = None
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_template = os.path.join(tmpdir, "media.%(ext)s")
 
-        # Если ffmpeg есть — жмём в легкий mp3.
-        # Если ffmpeg НЕТ — просим yt-dlp скачать готовый однофайловый поток (m4a/webm/mp4) без склейки!
-        if FFMPEG_LOCATION:
-            audio_opts = {
-                **base_ydl_opts,
-                'format': 'worstaudio/bestaudio/worst',
-                'outtmpl': out_template,
-                'ffmpeg_location': FFMPEG_LOCATION,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '64',
-                }],
-            }
+        # Если нам нужен и коллаж кадров, и звук — просим у yt-dlp самый легкий комбинированный видеофайл (до 480p)
+        if need_grid:
+            fmt = "worst[ext=mp4][height>=240]/worst[ext=mp4]/worst/best[height<=480]/best"
         else:
-            audio_opts = {
-                **base_ydl_opts,
-                # Берем одиночный аудиофайл (m4a/webm), а если у сайта (например, Instagram/TikTok)
-                # видео и звук идут одним мелким mp4-файлом — берем самый легкий mp4 до 20 МБ
-                'format': 'worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/worst[ext=mp4]/worst',
-                'outtmpl': out_template,
-            }
+            fmt = "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/worst"
 
-        audio_opts.pop('skip_download', None)
+        dl_opts = {
+            **base_ydl_opts,
+            'format': fmt,
+            'outtmpl': out_template,
+            'max_filesize': 150 * 1024 * 1024,  # Защита диска от многочасовых стримов (> 150 МБ)
+        }
+        if FFMPEG_LOCATION:
+            dl_opts['ffmpeg_location'] = FFMPEG_LOCATION
+        dl_opts.pop('skip_download', None)
 
         def download() -> str | None:
-            with yt_dlp.YoutubeDL(audio_opts) as ydl:
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 ydl.download([clean_url])
             for fname in os.listdir(tmpdir):
                 full_p = os.path.join(tmpdir, fname)
@@ -244,52 +246,72 @@ async def transcribe_via_audio(clean_url: str, base_ydl_opts: dict) -> str | Non
             return None
 
         try:
-            media_path = await asyncio.wait_for(asyncio.to_thread(download), timeout=90.0)
+            media_path = await asyncio.wait_for(asyncio.to_thread(download), timeout=120.0)
         except asyncio.TimeoutError:
-            logger.warning("Таймаут скачивания медиа для распознавания речи.")
-            return None
+            logger.warning("Таймаут скачивания видео по ссылке.")
+            return None, None
         except Exception as e:
-            logger.warning(f"Ошибка скачивания медиа для распознавания речи: {e}")
+            logger.warning(f"Ошибка скачивания медиа по ссылке: {e}")
             await _maybe_alert_cookie_issue(str(e))
-            return None
+            return None, None
 
         if not media_path or not os.path.exists(media_path):
-            return None
+            return None, None
 
-        size_mb = os.path.getsize(media_path) / (1024 * 1024)
-        if size_mb > 24:
-            logger.warning(f"Медиафайл слишком большой ({size_mb:.1f}MB) — пропускаем распознавание.")
-            return None
+        # 1. Создаем коллаж 2x2 из 4 кадров видео (чтобы нейросеть видела картинку и вшитый текст)
+        if need_grid:
+            try:
+                grid_bytes = await media_processor.make_video_storyboard_grid(media_path)
+                if grid_bytes:
+                    logger.info("✅ Создан коллаж 2x2 для видео по ссылке.")
+            except Exception as e:
+                logger.warning(f"Не удалось сделать коллаж для видео по ссылке: {e}")
 
-        # Определяем корректный MIME-тип по расширению скачанного файла
-        ext = os.path.splitext(media_path)[1].lower().lstrip(".")
-        mime_map = {
-            "mp3": "audio/mpeg",
-            "m4a": "audio/mp4",
-            "mp4": "video/mp4",
-            "webm": "audio/webm",
-            "ogg": "audio/ogg",
-            "opus": "audio/ogg",
-            "wav": "audio/wav",
-        }
-        mime_type = mime_map.get(ext, "audio/mp4")
+        # 2. Распознаём речь (если файл большой — предварительно сжимаем звук в легкий моно-MP3 32kbps)
+        if need_transcript:
+            audio_target_path = media_path
+            size_mb = os.path.getsize(media_path) / (1024 * 1024)
 
-        try:
-            with open(media_path, "rb") as f:
-                media_bytes = f.read()
+            # Если скачалось видео или файл тяжелее 15 МБ — вырезаем и сжимаем только голос через ffmpeg
+            if FFMPEG_LOCATION or size_mb > 15:
+                compressed_audio = await media_processor.compress_audio_for_ai(media_path)
+                if compressed_audio and os.path.exists(compressed_audio):
+                    audio_target_path = compressed_audio
+                    size_mb = os.path.getsize(audio_target_path) / (1024 * 1024)
 
-            # Сначала пробуем наш единый каскад из ai_core (Groq Whisper -> Gemini Flash)
-            text = await ai_core.transcribe_audio(media_bytes, mime_type=mime_type)
-            if text:
-                logger.info(f"✅ УСПЕШНО ТРАНСКРИБИРОВАНО ВИДЕО ({ext}, {size_mb:.1f}MB): {text[:100]}...")
-                return text
-        except Exception as e:
-            logger.warning(f"Ошибка транскрибации видео через каскад ai_core: {e}")
+            if size_mb <= 24:
+                ext = os.path.splitext(audio_target_path)[1].lower().lstrip(".")
+                mime_map = {
+                    "mp3": "audio/mpeg", "m4a": "audio/mp4", "mp4": "video/mp4",
+                    "webm": "audio/webm", "ogg": "audio/ogg", "opus": "audio/ogg", "wav": "audio/wav",
+                }
+                mime_type = mime_map.get(ext, "audio/mpeg")
+                try:
+                    with open(audio_target_path, "rb") as f:
+                        media_bytes = f.read()
+                    transcript = await ai_core.transcribe_audio(media_bytes, mime_type=mime_type)
+                    if transcript:
+                        logger.info(f"✅ УСПЕШНО ТРАНСКРИБИРОВАНО ВИДЕО ({ext}, {size_mb:.1f}MB): {transcript[:100]}...")
+                except Exception as e:
+                    logger.warning(f"Ошибка транскрибации видео по ссылке: {e}")
+            else:
+                logger.warning(f"Даже после сжатия аудио весит {size_mb:.1f} МБ — пропускаем STT.")
 
-        return None
+    return transcript, grid_bytes
 
 
-async def parse_youtube(url: str) -> str:
+async def transcribe_via_audio(clean_url: str, base_ydl_opts: dict) -> str | None:
+    """Обертка для обратной совместимости: возвращает только текст расшифровки."""
+    transcript, _ = await download_and_analyze_url_video(
+        clean_url, base_ydl_opts, need_transcript=True, need_grid=False
+    )
+    return transcript
+
+
+async def parse_youtube(url: str) -> tuple[str, bytes | None]:
+    """
+    Парсит видео YouTube: возвращает (текстовое_описание_и_субтитры, байты_картинки_или_коллажа).
+    """
     try:
         # 1. Извлекаем чистый ID
         video_id = None
@@ -306,7 +328,7 @@ async def parse_youtube(url: str) -> str:
             video_id = video_id.split("/")[0]  # на случай хвостовых /что-то в пути
 
         if not video_id:
-            return f"[Видео на YouTube (не удалось извлечь ID: {url})]"
+            return f"[Видео на YouTube (не удалось извлечь ID: {url})]", None
 
         clean_url = f"https://www.youtube.com/watch?v={video_id}"
 
@@ -337,7 +359,7 @@ async def parse_youtube(url: str) -> str:
         if not info:
             # Все клиенты отвалились — если причина похожа на протухшие куки/антибот, пишем админу
             await _maybe_alert_cookie_issue(last_error_text)
-            return "[Видео на YouTube (ошибка получения данных)]"
+            return "[Видео на YouTube (ошибка получения данных)]", None
 
         # Дальше используем именно тот клиент, который сработал — он же, скорее всего,
         # успешнее отдаст и субтитры/аудио, раз именно его YouTube сейчас пропускает.
@@ -346,6 +368,7 @@ async def parse_youtube(url: str) -> str:
         title = info.get('title', 'Неизвестное видео')
         channel = info.get('uploader', 'Неизвестный канал')
         description = (info.get('description') or '')[:300]
+        duration = info.get('duration') or 0
         video_info = f"[YouTube Видео]\nНазвание: {title}\nКанал: {channel}\nОписание: {description}...\n"
 
         # 3. Вытягиваем ссылки на авто-субтитры
@@ -420,38 +443,58 @@ async def parse_youtube(url: str) -> str:
             except Exception as e:
                 logger.warning(f"Резервный парсер тоже не справился: {e}")
 
-        # 6. ПОСЛЕДНИЙ РУБЕЖ: оба текстовых способа отдали 429 / ничего не нашли —
-        # скачиваем аудио и распознаём его сами через Whisper, не завися от YouTube.
+        # 6. ПОЛУЧЕНИЕ ВИЗУАЛЬНОГО КОНТЕКСТА (КОЛЛАЖ 2x2 ИЛИ ПРЕВЬЮ) + WHISPER ПРИ ОТСУТСТВИИ СУБТИТРОВ
+        visual_bytes = None
+        is_short_video = ("shorts/" in url) or (0 < duration <= 180)
+
         if not extracted_subtitles:
-            whisper_text = await transcribe_via_audio(clean_url, base_opts)
+            # Если субтитров нет вообще — качаем легкое видео, делаем и расшифровку Whisper, и коллаж 2x2!
+            whisper_text, visual_bytes = await download_and_analyze_url_video(
+                clean_url, base_opts, need_transcript=True, need_grid=True
+            )
             if whisper_text:
                 extracted_subtitles = f"\n[Субтитры (распознано через Whisper)]: {whisper_text[:6000]}..." \
                     if len(whisper_text) > 6000 else f"\n[Субтитры (распознано через Whisper)]: {whisper_text}"
             else:
-                extracted_subtitles = "\n[Субтитры недоступны (YouTube заблокировал запрос, в видео нет речи, " \
-                                       "или не настроен GROQ_API_KEY для Whisper-фолбэка)]"
+                extracted_subtitles = "\n[Устной речи или субтитров не обнаружено — проанализируй видео по прикрепленному коллажу кадров]"
+        elif is_short_video:
+            # Если это короткий ролик (Shorts до 3 минут), даже при наличии субтитров делаем быстрый коллаж 2x2
+            _, visual_bytes = await download_and_analyze_url_video(
+                clean_url, base_opts, need_transcript=False, need_grid=True
+            )
 
-        return video_info + extracted_subtitles
+        # Если коллаж не делали (например, длинное видео на 40 минут, где уже есть субтитры) —
+        # скачиваем обложку видео (thumbnail), чтобы нейросеть всё равно видела картинку!
+        if not visual_bytes and info.get("thumbnail"):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(info["thumbnail"], timeout=6) as resp:
+                        if resp.status == 200:
+                            visual_bytes = await resp.read()
+            except Exception:
+                pass
+
+        return video_info + extracted_subtitles, visual_bytes
 
     except asyncio.TimeoutError:
         logger.warning(f"Таймаут парсинга YouTube: {url}")
-        return f"[Видео на YouTube] (Таймаут получения данных)"
+        return f"[Видео на YouTube] (Таймаут получения данных)", None
     except Exception as e:
         logger.warning(f"Ошибка yt-dlp: {e}")
-        return f"[Видео на YouTube по ссылке {url}]"
+        return f"[Видео на YouTube по ссылке {url}]", None
+
 
 # Другие платформы, которые понимает yt-dlp и где имеет смысл пытаться вытащить видео.
 # У них, в отличие от YouTube, обычно нет готовой текстовой дорожки субтитров —
-# поэтому единственный реалистичный путь понять содержание — аудио + Whisper.
-OTHER_VIDEO_HOSTS = ("tiktok.com", "instagram.com", "x.com", "twitter.com")
+# поэтому мы извлекаем из них и аудио для Whisper, и коллаж 2x2 из 4 кадров!
+OTHER_VIDEO_HOSTS = ("tiktok.com", "instagram.com", "x.com", "twitter.com", "reddit.com", "redd.it", "vk.com")
 
 
-async def parse_generic_video(url: str) -> str:
+async def parse_generic_video(url: str) -> tuple[str, bytes | None]:
     """
-    Универсальный путь для TikTok/Instagram/X и т.п.: metadata через yt-dlp +
-    аудио-фолбэк через Whisper. Instagram и X часто отдают видео только залогиненным —
-    так что для них YTDLP_COOKIES_FILE (с куками именно под тот сайт) особенно важен.
-    TikTok обычно отдаёт публичные ролики и без кук.
+    Универсальный путь для TikTok/Instagram/X/Reddit/VK:
+    1) Метаданные через yt-dlp.
+    2) Скачивание видео -> аудио-фолбэк через Whisper + коллаж 2x2 из 4 кадров для чтения текста на экране!
     """
     base_opts = build_base_ydl_opts()
     opts = {**base_opts, 'skip_download': True}
@@ -463,14 +506,14 @@ async def parse_generic_video(url: str) -> str:
     try:
         info = await asyncio.wait_for(asyncio.to_thread(get_info), timeout=15.0)
     except asyncio.TimeoutError:
-        return f"[Видео по ссылке {url}] (таймаут получения данных)"
+        return f"[Видео по ссылке {url}] (таймаут получения данных)", None
     except Exception as e:
         logger.warning(f"Не удалось получить метаданные {url}: {e}")
         await _maybe_alert_cookie_issue(str(e))
-        return f"[Видео по ссылке {url} (не удалось получить данные — возможно, нужны куки для этого сайта)]"
+        return f"[Видео по ссылке {url} (не удалось получить данные — возможно, нужны куки для этого сайта)]", None
 
     if not info:
-        return f"[Видео по ссылке {url} (пусто)]"
+        return f"[Видео по ссылке {url} (пусто)]", None
 
     title = info.get('title', 'Без названия')
     uploader = info.get('uploader', 'Неизвестный автор')
@@ -478,21 +521,25 @@ async def parse_generic_video(url: str) -> str:
     platform_name = info.get('extractor_key', 'видео')
     video_info = f"[{platform_name}]\nНазвание: {title}\nАвтор: {uploader}\nОписание: {description}...\n"
 
-    whisper_text = await transcribe_via_audio(url, base_opts)
+    # Скачиваем ролик, вытаскиваем и расшифровку речи, и коллаж 2x2 из кадров!
+    whisper_text, grid_bytes = await download_and_analyze_url_video(
+        url, base_opts, need_transcript=True, need_grid=True
+    )
     if whisper_text:
-        body = f"\n[Распознано через Whisper]: {whisper_text[:6000]}..." \
-            if len(whisper_text) > 6000 else f"\n[Распознано через Whisper]: {whisper_text}"
+        body = f"\n[Распознанная речь из видео]: {whisper_text[:6000]}..." \
+            if len(whisper_text) > 6000 else f"\n[Распознанная речь из видео]: {whisper_text}"
     else:
-        body = "\n[Аудио/речь распознать не удалось]"
+        body = "\n[Устной речи в видео не обнаружено — проанализируй видеоряд и надписи по прикрепленной раскадровке 2x2]"
 
-    return video_info + body
+    return video_info + body, grid_bytes
+
 
 async def extract_video_file_context(video_bytes: bytes, is_gif: bool = False) -> tuple[str | None, bytes | None]:
     """
-    Для прикрепленных видео, кружков и GIF:
-    1) Извлекает аудио и распознает речь через каскад (если не GIF).
-    2) Через ffmpeg делает 1 картинку-коллаж (2x2 из 4 кадров в разное время видео),
-       чтобы ИИ мог прочитать вшитые в видео субтитры/текст и увидеть суть без покадрового спама токенами.
+    Для прикрепленных видео, кружков и GIF (любого размера):
+    1) Сжимает аудиодорожку через media_processor.compress_audio_for_ai и распознает речь (если не GIF).
+    2) Через media_processor.make_video_storyboard_grid делает 1 картинку-коллаж (2x2 из 4 кадров
+       пропорционально длине видео), чтобы ИИ мог прочитать вшитые субтитры/текст и увидеть суть.
     """
     import ai_core
 
@@ -504,44 +551,34 @@ async def extract_video_file_context(video_bytes: bytes, is_gif: bool = False) -
         with open(in_path, "wb") as f:
             f.write(video_bytes)
 
-        # 1. Извлекаем речь (если это не беззвучная GIF-анимация)
+        # 1. Извлекаем и сжимаем речь (теперь даже если файл весит 100+ МБ, аудио сожмется до пару МБ)
         if not is_gif:
             try:
-                transcript = await ai_core.transcribe_audio(video_bytes, mime_type="video/mp4")
+                compressed_audio_path = await media_processor.compress_audio_for_ai(in_path)
+                if compressed_audio_path and os.path.exists(compressed_audio_path):
+                    with open(compressed_audio_path, "rb") as af:
+                        audio_bytes = af.read()
+                    transcript = await ai_core.transcribe_audio(audio_bytes, mime_type="audio/mpeg")
+                else:
+                    transcript = await ai_core.transcribe_audio(video_bytes, mime_type="video/mp4")
             except Exception as e:
                 logger.warning(f"Не удалось распознать речь из видеофайла: {e}")
 
-        # 2. Делаем легкий коллаж 2x2 из 4 кадров видео через ffmpeg (для чтения вшитых субтитров и видеоряда)
-        ffmpeg_bin = os.path.join(FFMPEG_LOCATION, "ffmpeg") if FFMPEG_LOCATION else shutil.which("ffmpeg")
-        if ffmpeg_bin:
-            out_jpg = os.path.join(tmpdir, "grid.jpg")
-            # Берем 4 кадра с интервалом и собираем в единую картинку tile=2x2 шириной 640px на кадр
-            cmd = [
-                ffmpeg_bin, "-y", "-i", in_path,
-                "-vf", "select='isnan(prev_selected_t)+gte(t-prev_selected_t,1.5)',scale=640:-1,tile=2x2",
-                "-frames:v", "1", "-q:v", "5", out_jpg
-            ]
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-                )
-                await asyncio.wait_for(proc.wait(), timeout=15.0)
-                if os.path.exists(out_jpg) and os.path.getsize(out_jpg) > 0:
-                    with open(out_jpg, "rb") as img_f:
-                        grid_image_bytes = img_f.read()
-            except Exception as e:
-                logger.warning(f"Не удалось создать раскадровку видео через ffmpeg: {e}")
+        # 2. Делаем коллаж 2x2 из 4 кадров по всей длине видео
+        try:
+            grid_image_bytes = await media_processor.make_video_storyboard_grid(in_path)
+        except Exception as e:
+            logger.warning(f"Не удалось создать раскадровку видео: {e}")
 
     return transcript, grid_image_bytes
 
+
 async def fetch_url_content(url: str):
     if "youtube.com" in url or "youtu.be" in url:
-        text = await parse_youtube(url)
-        return text, None
+        return await parse_youtube(url)
 
     if any(host in url for host in OTHER_VIDEO_HOSTS):
-        text = await parse_generic_video(url)
-        return text, None
+        return await parse_generic_video(url)
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -567,11 +604,22 @@ async def fetch_url_content(url: str):
                     text = re.sub(r'\n{3,}', '\n\n', text)  # Убираем лишние пустые строки
                     return f"[Содержимое сайта]:\n{text[:6000]}...", None
 
-                # 2. Если это картинка
+                # 2. Если это картинка (при необходимости сжимаем через media_processor)
                 elif 'image' in content_type:
-                    return f"[Пользователь прикрепил картинку]", file_bytes
+                    compressed_img = await media_processor.compress_image(file_bytes)
+                    return "[Пользователь прикрепил ссылку на картинку]", compressed_img
 
-                # 3. Если это PDF-документ
+                # 3. Если это прямая ссылка на видеофайл (.mp4, .webm, .mov)
+                elif 'video' in content_type:
+                    transcript, grid_bytes = await extract_video_file_context(file_bytes)
+                    info_str = f"[Прямая ссылка на видеофайл]\n"
+                    if transcript:
+                        info_str += f"[Распознанная речь]: {transcript[:6000]}"
+                    else:
+                        info_str += "[Видео без речи — проанализируй по прикрепленному коллажу кадров]"
+                    return info_str, grid_bytes
+
+                # 4. Если это PDF-документ
                 elif 'application/pdf' in content_type:
                     try:
                         doc = pymupdf.open(stream=file_bytes, filetype="pdf")
@@ -581,7 +629,7 @@ async def fetch_url_content(url: str):
                         logger.error(f"Ошибка парсинга PDF: {e}")
                         return "[Не удалось прочитать PDF документ]", None
 
-                # 4. Неизвестные файлы (Попытка прочитать как текст: логи, код, конфиги)
+                # 5. Неизвестные файлы (Попытка прочитать как текст: логи, код, конфиги)
                 else:
                     try:
                         text = file_bytes.decode('utf-8')

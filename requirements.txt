@@ -13,3 +13,8 @@ yt-dlp
 markdownify
 pymupdf
 python-docx
+
+ffmpeg-python
+aiofiles
+kurigram
+tgcrypto

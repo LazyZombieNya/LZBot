@@ -14,14 +14,18 @@ CLASSIC_MAX_LENGTH = 4096   # Лимит обычного sendMessage — 4 096 
 
 def sanitize_gfm_markdown(text: str) -> str:
     r"""
-    Очищает текст для RichMessage:
-    1. Переносит блоки <think>...</think> в <details>.
-    2. Удаляет теги <tg-thinking>.
-    3. Защищает знак $ перед числами (\$10).
+    Очищает и форматирует текст для отправки в sendRichMessage (режим {"markdown": "..."}):
+    1. Переносит блоки мыслей <think>...</think> в сворачиваемый спойлер <details>.
+    2. Удаляет служебные теги <tg-thinking> (они разрешены только внутри черновика sendRichMessageDraft).
+    3. Конвертирует случайно попавшие HTML-теги (<b>, <i>) в Markdown (**bold**, *italic*).
+    4. Разбивает склеенные через ' • ' элементы и одиночные переносы строк, чтобы в GFM
+       списки праздников и пунктов никогда не слипались в один сплошной абзац.
+    5. Защищает одиночный знак валюты $ перед числами (\$10), чтобы не включался LaTeX.
     """
     if not text:
         return ""
 
+    # 1. Превращаем закрытые блоки <think>...</think> (например, от DeepSeek/Qwen) в <details>
     def _think_to_details(match):
         thought = match.group(1).strip()
         if not thought:
@@ -32,10 +36,46 @@ def sanitize_gfm_markdown(text: str) -> str:
     text = text.replace('<think>', '').replace('</think>', '')
     text = re.sub(r'</?tg-thinking>', '', text)
 
-    # Защищаем блоки кода от экранирования знака $
+    # 2. Защищаем блоки кода ```...``` и `...` от любых автозамен текста
     parts = re.split(r'(```[\s\S]*?```|`[^`\n]+`)', text)
     for i in range(0, len(parts), 2):
-        parts[i] = re.sub(r'(?<![\\$])\$(\d)', r'\\$\1', parts[i])
+        chunk = parts[i]
+
+        # Заменяем случайные HTML-теги жирного/курсива на GFM Markdown
+        chunk = re.sub(r'</?b>', '**', chunk)
+        chunk = re.sub(r'</?strong>', '**', chunk)
+        chunk = re.sub(r'</?i>', '*', chunk)
+        chunk = re.sub(r'</?em>', '*', chunk)
+
+        # Если нейросеть слепила пункты в одну строку через " • " — переносим каждый на новую строку списка
+        chunk = re.sub(r'\s+•\s+', '\n- ', chunk)
+        # Если строка начинается с буллита "• " — меняем на стандартный дефис списка "- "
+        chunk = re.sub(r'^[ \t]*•[ \t]*', '- ', chunk, flags=re.MULTILINE)
+
+        # В GFM одиночный перенос строки (\n) между двумя обычными строками склеивает их в один абзац.
+        # Поэтому если строка не является частью таблицы (не начинается с '|') и не пустая,
+        # превращаем одиночные переносы перед новыми пунктами/эмодзи в двойные (\n\n) или в список.
+        lines = chunk.split('\n')
+        formatted_lines = []
+        for idx, line in enumerate(lines):
+             stripped = line.strip()
+             # Если это конец предыдущей обычной строки, а следующая начинается с эмодзи или жирного пункта,
+             # но между ними нет пустой строки — добавляем пустую строку, чтобы GFM не слепил их в кучу
+             if (
+                 idx > 0
+                 and stripped
+                 and lines[idx - 1].strip()
+                 and not stripped.startswith(('-', '*', '#', '>', '|', '<'))
+                 and not lines[idx - 1].strip().startswith(('|', '<'))
+                 and not re.match(r'^\d+\.', stripped)
+             ):
+                 formatted_lines.append("")
+             formatted_lines.append(line)
+        chunk = "\n".join(formatted_lines)
+
+        # 3. Экранируем знак валюты $ перед цифрами ($10 -> \$10), чтобы парсер не считал это LaTeX-формулой
+        chunk = re.sub(r'(?<![\\$])\$(\d)', r'\\$\1', chunk)
+        parts[i] = chunk
 
     return "".join(parts).strip()
 
@@ -80,9 +120,10 @@ def gfm_to_fallback_html(text: str) -> str:
     text = re.sub(r'<h[1-6][^>]*>(.*?)</h[1-6]>', r'<b>\1</b>', text, flags=re.DOTALL)
     text = re.sub(r'<hr\s*/?>', '───────────────', text)
 
-    # 3. Конвертируем базовый GFM Markdown в HTML
+    # 3. Конвертируем базовый GFM Markdown в классический HTML
     text = re.sub(r'^(#{1,6})\s+(.+)$', r'<b>\2</b>', text, flags=re.MULTILINE)
     text = re.sub(r'^---+$', '───────────────', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*[-*][ \t]+(.+)$', r'• \1', text, flags=re.MULTILINE)
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'<i>\1</i>', text)
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
@@ -96,6 +137,7 @@ def gfm_to_fallback_html(text: str) -> str:
 
 
 def split_text(text: str, max_len: int = CLASSIC_MAX_LENGTH) -> list[str]:
+    """Разбивает длинный текст на части по переносам строк, не превышая max_len."""
     parts = []
     while len(text) > max_len:
         idx = text[:max_len].rfind("\n")
@@ -111,7 +153,8 @@ def split_text(text: str, max_len: int = CLASSIC_MAX_LENGTH) -> list[str]:
 def extract_any_message_text(msg: Message | None) -> str:
     """
     Извлекает текст как из обычного сообщения (msg.text / msg.caption),
-    так и из RichMessage (где msg.text == None, а данные лежат в api_kwargs['rich_message']).
+    так и из RichMessage (где msg.text == None, а дерево блоков лежит в api_kwargs['rich_message']).
+    Нужно для работы реплаев и кнопки '📖 Подробнее'.
     """
     if not msg:
         return ""
@@ -224,9 +267,14 @@ async def send_rich_safe(
 
 class RichStatusTracker:
     """
-    Отображает процесс размышлений и действий бота перед ответом:
-    - В ЛС (private) использует sendRichMessageDraft с тегом <tg-thinking> и кнопкой остановки (can_stop=True).
-    - В группах (или при недоступности Draft API) плавно обновляет обычное сообщение ожидания.
+    Отображает живой процесс размышлений и действий бота перед ответом:
+    - В ЛС (private): использует нативный sendRichMessageDraft с тегом <tg-thinking>
+      и встроенной кнопкой остановки (can_stop=True).
+    - Автоматически поддерживает жизнь черновика (keep-alive каждые 15 сек),
+      чтобы плашка <tg-thinking> не исчезала по 30-секундному таймауту Telegram во время долгих закачек!
+    - В группах (где Telegram API запрещает вызывать sendRichMessageDraft):
+      рисует красивую многошаговую панель размышлений (выполненные шаги с ✅, активный шаг с ⏳
+      и сворачиваемая цитата с мыслями ИИ) + инлайн-кнопка "🛑 Отмена".
     """
     def __init__(self, bot: Bot, chat_id: int, chat_type: str, reply_to_message_id: int = None, cancel_kb=None):
         self.bot = bot
@@ -236,24 +284,68 @@ class RichStatusTracker:
         self.cancel_kb = cancel_kb
         self.draft_id = int(time.time() * 1000) % 1_000_000_000 or 1
         self.steps: list[str] = []
+        self.last_thought: str = ""
         self.wait_msg: Message | None = None
+        # В Telegram Bot API метод sendRichMessageDraft работает ТОЛЬКО в личных чатах (private)
         self.draft_supported = (chat_type == "private")
         self._last_update_ts = 0.0
+        self._keepalive_task = None
+        self._closed = False
+
+    def _ensure_keepalive(self):
+        """Запускает фоновый таймер, который не дает черновику sendRichMessageDraft протухнуть через 30 сек."""
+        if self.draft_supported and self._keepalive_task is None and not self._closed:
+            import asyncio
+            self._keepalive_task = asyncio.create_task(self._keep_alive_loop())
+
+    async def _keep_alive_loop(self):
+        """Каждые 15 секунд обновляет черновик в ЛС, пока идет долгая операция (скачивание/сжатие)."""
+        import asyncio
+        while not self._closed and self.draft_supported:
+            await asyncio.sleep(15.0)
+            if self._closed or not self.draft_supported or not self.steps:
+                break
+            # Если с последнего обновления прошло больше 12 секунд — переотправляем текущий статус
+            if time.monotonic() - self._last_update_ts >= 12.0:
+                try:
+                    await self._render(force=True)
+                except Exception:
+                    pass
 
     async def step(self, step_text: str, thought_preview: str = "", force: bool = False):
-        if step_text and (not self.steps or self.steps[-1] != step_text):
-            self.steps.append(step_text)
+        """Добавляет новый шаг (или обновляет проценты скачивания на месте) и отрисовывает статус."""
+        if self._closed:
+            return
 
-        thinking_lines = "\n".join(f"• {s}" for s in self.steps)
+        if step_text:
+            # Если это обновление процентов скачивания ("📥 Качаю...") — заменяем предыдущую строку процентов на месте,
+            # чтобы не плодить десятки строк "10%... 20%... 30%..."
+            if (
+                self.steps
+                and step_text.startswith("📥 Качаю большой файл")
+                and (self.steps[-1].startswith("📥 Качаю большой файл") or self.steps[-1].startswith("📦 "))
+            ):
+                self.steps[-1] = step_text
+            elif not self.steps or self.steps[-1] != step_text:
+                self.steps.append(step_text)
+
         if thought_preview:
-            thinking_lines += f"\n\n{thought_preview.strip()}"
+            self.last_thought = thought_preview.strip()
 
+        self._ensure_keepalive()
+        await self._render(force=force)
+
+    async def _render(self, force: bool = False):
         now = time.monotonic()
 
-        # 1. В личных чатах стримим <tg-thinking> через sendRichMessageDraft
+        # 1. В личных чатах (private) стримим <tg-thinking> через sendRichMessageDraft
         if self.draft_supported:
             if not force and (now - self._last_update_ts < 0.7):
                 return
+            thinking_lines = "\n".join(f"• {s}" for s in self.steps)
+            if self.last_thought:
+                thinking_lines += f"\n\n{self.last_thought}"
+
             draft_md = f"<tg-thinking>{thinking_lines}</tg-thinking>"
             try:
                 await _call_bot_api("sendRichMessageDraft", {
@@ -266,12 +358,25 @@ class RichStatusTracker:
                 self._last_update_ts = now
                 return
             except Exception as e:
-                logger.debug(f"sendRichMessageDraft не сработал, переключаюсь на обычное сообщение ожидания: {e}")
+                logger.debug(f"sendRichMessageDraft не сработал, переключаюсь на групповой виджет: {e}")
                 self.draft_supported = False
 
-        # 2. Фолбэк (для групп или если Draft API недоступен)
-        current_label = self.steps[-1] if self.steps else "⏳ Ждём ответ..."
-        display_text = f"⏳ <i>{html.escape(current_label)}</i>"
+        # 2. Для групповых чатов: формируем красивую многошаговую карточку размышлений
+        step_lines = []
+        for idx, s in enumerate(self.steps):
+            if idx < len(self.steps) - 1:
+                # Прошлые завершенные этапы помечаем галочкой
+                step_lines.append(f"✅ <i>{html.escape(s)}</i>")
+            else:
+                # Текущий активный этап выделяем жирным и песочными часами
+                step_lines.append(f"⏳ <b>{html.escape(s)}</b>")
+
+        steps_block = "\n".join(step_lines) if step_lines else "⏳ <b>Думаю...</b>"
+        display_text = f"💭 <b>Ход работы бота:</b>\n<blockquote expandable>{steps_block}"
+        if self.last_thought:
+            display_text += f"\n\n🧠 <i>{html.escape(self.last_thought)}</i>"
+        display_text += "</blockquote>"
+
         try:
             if not self.wait_msg:
                 self.wait_msg = await self.bot.send_message(
@@ -282,6 +387,7 @@ class RichStatusTracker:
                     reply_markup=self.cancel_kb,
                     disable_notification=True,
                 )
+                self._last_update_ts = now
             elif force or (now - self._last_update_ts >= 1.2):
                 await self.bot.edit_message_text(
                     chat_id=self.chat_id,
@@ -295,6 +401,11 @@ class RichStatusTracker:
             pass
 
     async def cleanup(self):
+        """Останавливает фоновый таймер и удаляет временное окно статуса в группе перед отправкой ответа."""
+        self._closed = True
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
         if self.wait_msg:
             try:
                 await self.wait_msg.delete()
