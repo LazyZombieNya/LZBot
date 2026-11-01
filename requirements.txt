@@ -3,7 +3,6 @@ google-genai
 openai
 python-dotenv
 httpx
-aiohttp
 Pillow
 aiosqlite
 aiohttp
@@ -13,7 +12,6 @@ yt-dlp
 markdownify
 pymupdf
 python-docx
-
 ffmpeg-python
 aiofiles
 kurigram
