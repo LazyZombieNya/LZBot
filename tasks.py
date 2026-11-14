@@ -56,16 +56,22 @@ def get_gemini_sort_score(model_id: str) -> float:
     return score
 
 
-async def sync_gemini_models():
+async def sync_gemini_models() -> tuple[int, int]:
+    """
+    Запрашивает актуальный список моделей у Google Gemini API и обновляет models.json.
+    Возвращает кортеж: (всего_найдено_чат_моделей, показано_в_меню).
+    """
     if not config.GEMINI_API_KEY:
-        return
+        return 0, 0
 
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={config.GEMINI_API_KEY}"
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=15) as resp:
                 if resp.status != 200:
-                    return
+                    err_body = await resp.text()
+                    logger.warning(f"Gemini API вернул статус {resp.status} при получении списка моделей: {err_body[:200]}")
+                    return 0, 0
                 models_data = (await resp.json()).get("models", [])
 
         parsed_models = []
@@ -79,7 +85,6 @@ async def sync_gemini_models():
             m_id_lower = m_id.lower()
 
             # 1. Берем ТОЛЬКО модели с поддержкой стандартного generateContent
-            # (Чистые Live-модели с bidiGenerateContent требуют WebSocket и роняют обычный API-вызов)
             methods = m.get("supportedGenerationMethods", [])
             if "generateContent" not in methods:
                 continue
@@ -90,8 +95,7 @@ async def sync_gemini_models():
             if m_id_lower.endswith("-latest"):
                 continue
 
-            # 3. Защита от дублей: если уже есть стабильная "gemini-3.1-flash-lite",
-            # то старую "gemini-3.1-flash-lite-preview" пропускаем
+            # 3. Защита от дублей: если уже есть стабильная версия, preview пропускаем
             base_id = m_id_lower.replace("-preview", "").replace("-exp", "")
             if base_id in seen_base_ids and ("preview" in m_id_lower or "exp" in m_id_lower):
                 continue
@@ -110,10 +114,8 @@ async def sync_gemini_models():
             elif "lyria" in m_id_lower:
                 capabilities = ["audio_out"]
             elif m_id_lower.startswith("gemma-"):
-                # Открытые модели Gemma оставляем в резерве (только текст/картинки)
                 capabilities = ["text", "image"]
             else:
-                # Все основные модели Gemini (4 Argon, 3.8..3.0 Flash/Pro, 2.5 Flash/Pro)
                 capabilities = ["text", "image", "audio", "video"]
                 is_chat_candidate = True
 
@@ -122,12 +124,12 @@ async def sync_gemini_models():
                 "name": make_gemini_display_name(m.get("displayName", m_id)),
                 "provider": "gemini",
                 "capabilities": capabilities,
-                "selectable": False,  # Включим ниже для ТОП-10
+                "selectable": False,
                 "is_chat_candidate": is_chat_candidate,
                 "score": get_gemini_sort_score(m_id) if is_chat_candidate else -1000.0
             })
 
-        # Сортируем кандидатов по нашему рейтингу (от 4 Argon до 2.5 Flash-Lite)
+        # Сортируем кандидатов по рейтингу (от самых свежих версий к более ранним)
         chat_models = sorted(
             [m for m in parsed_models if m["is_chat_candidate"]],
             key=lambda x: x["score"],
@@ -135,10 +137,10 @@ async def sync_gemini_models():
         )
         service_models = [m for m in parsed_models if not m["is_chat_candidate"]]
 
-        # Первые 10 лучших моделей показываем в меню /model (туда войдут и 4 Argon, и 3.x, и 2.5 Flash),
-        # а остальные чат-модели оставляем в базе как скрытый резерв (selectable=False)
+        # Первые 14 лучших моделей показываем в меню /model, остальные остаются в скрытом резерве
+        selectable_limit = 14
         for i, m in enumerate(chat_models):
-            if i < 10:
+            if i < selectable_limit:
                 m["selectable"] = True
 
         active_gemini_models = chat_models + service_models
@@ -146,10 +148,14 @@ async def sync_gemini_models():
             m.pop("score", None)
             m.pop("is_chat_candidate", None)
 
-        await _update_json_config("gemini", active_gemini_models)
+        updated = await _update_json_config("gemini", active_gemini_models)
+        if not updated:
+            logger.info(f"Gemini: проверено {len(chat_models)} чат-моделей (новых изменений нет) ✅")
+        return len(chat_models), min(len(chat_models), selectable_limit)
 
     except Exception as e:
         logger.warning(f"Ошибка парсинга Gemini: {e}")
+        return 0, 0
 
 
 # ==========================================
@@ -315,6 +321,8 @@ async def _update_json_config(provider_name: str, new_provider_models: list):
         with open(config.MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(final_list, f, ensure_ascii=False, indent=2)
         logger.info(f"models.json успешно обновлен для провайдера: {provider_name} ✅")
+        return True
+    return False
 
 
 async def sync_api_models_job(context: ContextTypes.DEFAULT_TYPE):

@@ -111,7 +111,7 @@ def main():
     app.add_handler(CommandHandler("pay", handlers.pay_command))
     app.add_handler(CommandHandler("events", handlers.events_command))
     app.add_handler(CommandHandler("mute_bday", handlers.mute_bday_command))
-
+    app.add_handler(CommandHandler("sync_models", handlers.sync_models_command))
 
     app.add_handler(CallbackQueryHandler(handlers.pay_callback, pattern="^paid:"))
     app.add_handler(CallbackQueryHandler(handlers.admin_confirm_callback, pattern="^admin_(confirm|reject):"))

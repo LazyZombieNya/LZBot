@@ -1225,3 +1225,21 @@ async def bday_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]])
         await query.edit_message_reply_markup(reply_markup=kb)
         await query.message.reply_text("🔔 Уведомления о ДР из этой группы снова включены!")
+
+async def sync_models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно обновляет списки моделей всех провайдеров (только для владельца)."""
+    if update.effective_user.id != config.ADMIN_ID:
+        return
+    import tasks
+    wait_msg = await update.message.reply_text("🔄 Синхронизирую списки моделей (Gemini, Groq, OpenRouter)...")
+    gem_total, gem_menu = await tasks.sync_gemini_models()
+    await tasks.sync_groq_models()
+    await tasks.sync_openrouter_models()
+
+    all_models = database.load_models_config()
+    gem_names = [f"• {m['name']} (`{m['id']}`)" for m in all_models if m["provider"] == "gemini" and m.get("selectable")]
+    text = (
+        f"✅ **Синхронизация завершена!**\n\n"
+        f"✨ **Gemini** (найдено {gem_total}, в меню {gem_menu}):\n" + "\n".join(gem_names)
+    )
+    await wait_msg.edit_text(text, parse_mode="Markdown")
