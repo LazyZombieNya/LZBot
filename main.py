@@ -8,10 +8,34 @@ import config
 import database
 import tasks
 import handlers
+import re
 import web_parser
 from access import init_billing_db
 
 logging.basicConfig(level=logging.INFO)
+
+
+class SecretMaskFilter(logging.Filter):
+    """Автоматически скрывает токен Telegram-бота во всех логах (включая httpx и traceback)."""
+    def __init__(self, token: str | None):
+        super().__init__()
+        self.token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.token:
+            # Формируем готовое сообщение с подставленными аргументами и заменяем токен
+            msg = record.getMessage()
+            if self.token in msg:
+                record.msg = msg.replace(self.token, "***TOKEN***")
+                record.args = None
+        return True
+
+
+# Вешаем фильтр на все обработчики корневого логгера
+_mask_filter = SecretMaskFilter(config.TELEGRAM_TOKEN)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_mask_filter)
+
 logger = logging.getLogger(__name__)
 
 class GenerationStoppedFilter(filters.MessageFilter):
@@ -44,15 +68,22 @@ async def on_startup(application):
 
 
 def main():
-    # 1. Увеличиваем таймауты ожидания ответа от Telegram,
-    # чтобы бот не падал из-за кратковременных лагов сети
+    # 1. Настраиваем таймауты как для обычных запросов, так и отдельно для getUpdates (поллинга).
+    # Критично при работе через HTTP/HTTPS прокси: если прокси-туннель "моргнет" и оставит сокет
+    # полуоткрытым (half-open), get_updates_read_timeout принудительно разорвет зависшее соединение
+    # и переподключится заново, не давая боту "уснуть".
     app = (
         ApplicationBuilder()
         .token(config.TELEGRAM_TOKEN)
-        .connect_timeout(30.0)
+        .connect_timeout(20.0)
         .read_timeout(30.0)
         .write_timeout(30.0)
-        .pool_timeout(30.0)
+        .pool_timeout(20.0)
+        .get_updates_connect_timeout(15.0)
+        .get_updates_read_timeout(15.0)
+        .get_updates_write_timeout(15.0)
+        .get_updates_pool_timeout(15.0)
+        .get_updates_connection_pool_size(4)
         .build()
     )
 
@@ -68,6 +99,8 @@ def main():
     app.job_queue.run_daily(tasks.monday_weekly_digest_job, time=time(hour=9, minute=5, tzinfo=config.BOT_TIMEZONE),days=(1,))
     # Пятничный анонс событий следующей недели в 16:00 по пятницам (5=Пт)
     app.job_queue.run_daily(tasks.friday_upcoming_events_job, time=time(hour=16, minute=0, tzinfo=config.BOT_TIMEZONE),days=(5,))
+    # Сторожевой таймер связи с Telegram через прокси (проверка каждые 2 минуты)
+    app.job_queue.run_repeating(tasks.telegram_watchdog_job, interval=120, first=60)
 
     app.add_handler(CommandHandler("start", handlers.start_command))
     app.add_handler(CommandHandler("reset", handlers.reset_history))
@@ -102,7 +135,12 @@ def main():
 
     # 2. drop_pending_updates=True заставляет бота ИГНОРИРОВАТЬ
     # все сообщения, которые были написаны, пока он был выключен.
-    app.run_polling(drop_pending_updates=True)
+    # timeout=10 и bootstrap_retries=-1 гарантируют мгновенный перезапуск опроса при сбое прокси.
+    app.run_polling(
+        drop_pending_updates=True,
+        timeout=10,
+        bootstrap_retries=-1,
+    )
 
 
 if __name__ == "__main__":

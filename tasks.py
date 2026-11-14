@@ -1,3 +1,4 @@
+import asyncio
 import html
 
 import aiohttp
@@ -501,3 +502,14 @@ async def monday_weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             logger.error(f"Ошибка еженедельного дайджеста в чате {chat_id_str}: {e}")
+
+async def telegram_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Сторожевой таймер (Watchdog): проверяет, что прокси и соединение с Telegram API живы.
+    Если прокси завис намертво — принудительно перезапускает контейнер (через restart: unless-stopped).
+    """
+    try:
+        await asyncio.wait_for(context.bot.get_me(), timeout=12.0)
+    except Exception as e:
+        logger.critical(f"🚨 Потеряна связь с Telegram API через прокси ({e}). Перезапускаю процесс...")
+        os._exit(1)
